@@ -54,7 +54,23 @@ Bachata S4+ 是从 **0.1.8 官方二进制**起手的改包项目（README 自�
    - 剩余未知项：APK 内二进制存放位置 → 由 `inspect-apk` 作业输出
 3. **自己实现前端**（成本最高）：公开源码缺 `android/`，需要重写 JNI + UI + 运行时解包。
 
-## 5. 尚未验证
+## 5. 云端构建环境（已按上游实现核对）
+
+上游没有把 arm64 runtime 放进它自己的 GitHub Actions（`.github/workflows/build.yml` 只构建
+Windows / macOS / Linux 桌面版），所以构建环境只能从脚本本身反推。结论有三条硬约束：
+
+| 约束 | 依据 |
+|---|---|
+| 必须在 **Debian trixie** 容器里构建 | `runtime/scripts/install-debian-runtime-deps.sh` 的 `BACHATA_DEBIAN_IMAGE` 默认值、`ID == debian` 断言、`dpkg --print-architecture == amd64` 断言 |
+| 依赖必须用上游脚本装 | 它校验 18 个包的 amd64/arm64 版本严格一致（`check_matching_candidate`），手写 apt 列表会在版本漂移时出错 |
+| 不能直接跑在 Ubuntu runner 上 | 构建脚本硬编码 `CMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu`；Ubuntu 多架构库在 `/usr/lib/aarch64-linux-gnu`，路径对不上 |
+
+另外，FEX（guest CPU 解释器）是构建期联网拉取的：`build-fexcore-smoke-aarch64.sh` 读
+`runtime/locks/components.lock.json` 里 `fex` 的 URL + 40 位 revision，用
+`checkout-component.sh` 以 `--filter=blob:none` 浅克隆，然后打 `runtime/patches/fex-fexcore-only.patch`。
+锁定的 FEX 版本是 `f2b679f6028ce1c38875233aecfcf5d3f8ebecec`，公网可匿名拉，CI 不需要任何凭据。
+
+## 6. 尚未验证
 
 - 编译：本机无 Linux 工具链（WSL 被安全策略拦截）、磁盘不足（C: 342MB / F: 1.9GB），
   本地无法编译；需云端验证
