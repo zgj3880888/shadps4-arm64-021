@@ -82,18 +82,65 @@ jobs:
           cat core/runtime/build/shadps4-arm64-stage/needed.txt
           sha256sum "$bin" | tee shadps4-arm64.sha256
 
+      - name: Stage artifacts
+        run: |
+          mkdir -p out
+          cp core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64 out/
+          cp core/runtime/build/shadps4-arm64-stage/needed.txt out/
+          cp shadps4-arm64.sha256 port-applied.stat port-applied.diff build.log out/
+          ls -la out
+
       - name: Upload patched core binary
         uses: actions/upload-artifact@v4
         with:
           name: shadps4-arm64-savefix
           if-no-files-found: error
+          path: out/
+
+  repack-apk:
+    name: Repack official APK with patched core
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch patched core
+        uses: actions/download-artifact@v4
+        with:
+          name: shadps4-arm64-savefix
+          path: out
+
+      - name: Install repack tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends unzip zip python3 zstd xz-utils
+          sudo apt-get install -y --no-install-recommends zipalign apksigner || \
+            echo "zipalign/apksigner 不可用，将输出未签名包"
+
+      - name: Download official APK
+        env:
+          APK_VERSION: v0.2.5
+        run: |
+          curl -sSL --retry 3 -o app.apk \
+            "https://github.com/JICA98/Bachata-S4/releases/download/${APK_VERSION}/bachatas4-0.2.5-release.apk"
+          sha256sum app.apk | tee apk.sha256
+
+      - name: Repack and sign
+        run: |
+          chmod +x out/shadps4-arm64 scripts/repack.sh
+          bash scripts/repack.sh app.apk out/shadps4-arm64 patched.apk 2>&1 | tee repack.log
+          sha256sum patched.apk | tee patched.sha256
+
+      - name: Upload repacked APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bachata-s4-savefix-apk
+          if-no-files-found: warn
           path: |
-            core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64
-            core/runtime/build/shadps4-arm64-stage/needed.txt
-            shadps4-arm64.sha256
-            port-applied.stat
-            port-applied.diff
-            build.log
+            patched.apk
+            patched.sha256
+            repack.log
+            apk.sha256
 
   inspect-apk:
     name: Inspect official APK layout

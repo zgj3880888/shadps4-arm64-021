@@ -23,8 +23,8 @@ PS4《GUNDAM BREAKER 3》（CUSA07651 / CUSA03594 家族）在 `sceSaveDataUmoun
 |---|---|
 | `patches/0001-save-data-backup-completion-callbacks.patch` | 4 个文件，+101/−23，等价于上游 PR #5226 |
 | `scripts/apply-port.sh` | 严格应用补丁（漂移就报错，不做模糊匹配）+ 落地标记校验 |
-| `scripts/repack.sh` | 探查官方 APK 内 arm64 二进制的存放位置（改包第一步） |
-| `.github/workflows/build.yml` | 云端交叉编译 aarch64 核心 + 导出 APK 布局报告 |
+| `scripts/repack.sh` | 真正的换二进制脚本：载荷探测（直放 / tar.zst / tar.xz）→ 替换 → 回写哈希清单 → 重打 → zipalign → apksigner |
+| `.github/workflows/build.yml` | 三个作业：交叉编译核心 → 换进官方 APK 并重签 → 导出 APK 布局报告 |
 | `scripts/push-local.sh` | 本机一条命令建仓并推送（已 `git init` 并完成首次提交） |
 
 ## 状态
@@ -46,7 +46,12 @@ PS4《GUNDAM BREAKER 3》（CUSA07651 / CUSA03594 家族）在 `sceSaveDataUmoun
 `CMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu`，这是 Debian 交叉工具链生成的路径；
 Ubuntu runner 的 arm64 多架构库在 `/usr/lib/aarch64-linux-gnu`，直接跑会对不上。
 
-另一个作业 `inspect-apk` 会下载官方 APK 并导出内部布局，用于确定替换点。
+另外两个作业：
+
+- `repack-apk`（依赖 `build`）：下载官方 APK，用 `scripts/repack.sh` 把新内核换进去、
+  回写哈希清单、`zipalign` + `apksigner` 重签，产出可直接安装的 `patched.apk`
+- `inspect-apk`：只导出官方 APK 的内部布局报告（`apk-layout`），不改任何东西
+
 
 ## 推送到 GitHub
 
