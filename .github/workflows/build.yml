@@ -79,6 +79,20 @@ jobs:
             core/*.log
           if-no-files-found: ignore
 
+      - name: Normalise shell line endings
+        # The base tree is maintained on Windows, so scripts can arrive with CRLF. A CRLF
+        # shebang becomes `#!/usr/bin/env bash\r`, which the kernel hands to env as the program
+        # name "bash\r" -> `env: 'bash\r': No such file or directory`, exit 127, before any of
+        # the script runs. Strip CR from every interpreter script in the checkout.
+        run: |
+          find core -type f \( -name '*.sh' -o -name '*.py' \) -exec sed -i 's/\r$//' {} + || true
+          echo "--- shebang check ---"
+          for f in core/runtime/scripts/build-shadps4-arm64.sh \
+                   core/runtime/scripts/install-debian-runtime-deps.sh \
+                   core/runtime/scripts/build-fexcore-smoke-aarch64.sh; do
+            printf '%s: ' "$f"; head -c 24 "$f" | od -c | head -1
+          done
+
       - name: Build ARM64 core inside Debian trixie container
         run: |
           set -euo pipefail
@@ -92,8 +106,8 @@ jobs:
               apt-get update
               apt-get install -y --no-install-recommends git ca-certificates
               git config --global --add safe.directory "*"
-              runtime/scripts/install-debian-runtime-deps.sh
-              runtime/scripts/build-shadps4-arm64.sh
+              bash runtime/scripts/install-debian-runtime-deps.sh
+              bash runtime/scripts/build-shadps4-arm64.sh
             ' 2>&1 | tee build.log
           tail -30 build.log
 
