@@ -279,13 +279,6 @@ jobs:
                   CMakeFiles/shadps4.dir/src/imgui/invitation_prompt_layer.cpp.o | tail -1)
                 echo "$cmd" | cut -c1-200
                 eval "$cmd -ferror-limit=0" || true
-                echo "=== vulkan-hpp macro state as that TU sees it ==="
-                diag=$(printf '%s' "$cmd" |
-                  sed -E 's# -o [^ ]+\.o##; s# -c # #; s# -MD##; s# -MT [^ ]+##; s# -MF [^ ]+##')
-                eval "$diag -E -dM" 2>/dev/null | grep -E "VULKAN_HPP_" | sort || true
-                echo "=== enhanced-mode guard around the Unique* aliases ==="
-                grep -n "VULKAN_HPP_DISABLE_ENHANCED_MODE" \
-                  /workspace/core/externals/vulkan-headers/include/vulkan/vulkan_handles.hpp | head -5
                 exit 1
               fi
             ' 2>&1 | tee build.log
