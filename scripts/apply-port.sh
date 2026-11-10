@@ -62,10 +62,28 @@ git submodule deinit -f -- externals/dear_imgui >/dev/null 2>&1 || true
 rm -rf externals/dear_imgui
 
 git submodule sync --recursive
-# No --depth here: the port pins exact revisions, and shallow fetches by SHA only work when the
-# commit happens to be a branch tip. Individual entries carry `shallow = true` in .gitmodules,
-# so the big ones (tracy, ffmpeg-core) still come down without full history.
-git submodule update --init --recursive --jobs 8
+
+# Pass 1: top level. No --depth here: the port pins exact revisions, and shallow fetches by SHA
+# only work when the commit happens to be a branch tip. Individual entries carry
+# `shallow = true` in .gitmodules, so the big ones (tracy, ffmpeg-core) still come down
+# without full history.
+git submodule update --init --jobs 8
+
+# Pass 2+: nested submodules, walking one level per pass (git only recurses into submodules
+# that are already initialised, so a single --recursive pass would miss depth 3).
+#
+# externals/mesa-kosmickrisp is skipped on purpose. CMake only adds it under
+# `if (APPLE AND NOT ENABLE_SYSTEM_VULKAN AND NOT ENABLE_TESTS)`, so no Linux/Android target
+# ever looks at it -- and its nested externals/mesa pins a commit its remote refuses to serve
+# (`upload-pack: not our ref`), which aborts the whole recursive update.
+for _pass in 1 2; do
+  git submodule foreach --quiet --recursive '
+    case "$displaypath" in
+      externals/mesa-kosmickrisp*) exit 0 ;;
+    esac
+    git submodule update --init --jobs 4
+  '
+done
 
 echo "== verifying port markers"
 fail=0

@@ -1,116 +1,134 @@
 name: build-arm64-core
 
-# Builds the Bachata S4 ARM64 emulator core: the whole Bachata ARM64 port (FEX guest CPU +
-# Android SAF broker + managed patch sessions) rebased onto upstream shadps4-emu/shadPS4
-# 0.21.1. Only the resulting core binary is produced here; the APK swap is a separate step.
+# Cross-compiles the Bachata S4 ARM64 emulator core: the whole Bachata ARM64 port
+# (FEX guest CPU + Android SAF broker + managed patch sessions) rebased onto upstream
+# shadps4-emu/shadPS4 0.21.1. Only the core binary is produced here; swapping it into
+# the APK is a separate step (scripts/repack-runtime.py).
 #
-# Three facts drive the shape of this workflow:
-#   1. The core is cross-compiled with the project's own Debian multiarch script, which
-#      hardcodes CMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu, so it must run inside a
-#      debian:trixie container rather than on the Ubuntu runner.
-#   2. The base checkout must be the Bachata ARM64 tree (it supplies runtime/scripts,
-#      runtime/locks, FEX orchestration and the Android-specific sources). The port diff is
-#      applied on top, so this job never needs write access to the upstream repo.
-#   3. The APK has no standalone bin/shadps4-arm64: the guest userland is one stored zip at
+# Shape notes — each one is load-bearing:
+#   1. The build runs in a debian:trixie *docker* container started from the Ubuntu runner,
+#      not as a job container. The project's cross script hardcodes
+#      CMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu and needs Debian multiarch; running it as
+#      a job container breaks checkout/upload actions and node availability.
+#   2. The base checkout must be the Bachata ARM64 tree: it supplies runtime/scripts,
+#      runtime/locks (the FEX pin), runtime/patches and the Android-specific sources. The
+#      port patch is applied on top, so this job never needs write access to any repo.
+#   3. CORE_REF is a commit SHA, not a branch. The patch is a full-tree diff against this
+#      exact tree; if the base moves, `git apply` must fail loudly instead of half-applying.
+#   4. The APK has no standalone bin/shadps4-arm64. The guest userland is one stored zip at
 #      assets/runtime/runtime.zip and the core lives inside it as host/shadps4-arm64-fex.
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-  workflow_dispatch:
-
-env:
-  # Base tree. Its runtime/ orchestration and FEX pin are reused as-is; the port patch replaces
-  # the emulator sources with the upstream 0.21.1 ones plus the ARM64/Android glue.
-  CORE_URL: https://github.com/Nyces/shadps4-arm64.git
-  CORE_REF: main
 
 permissions:
   contents: read
 
+concurrency:
+  group: arm64-core-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEBIAN_IMAGE: debian:trixie
+  CORE_URL: https://github.com/Nyces/shadps4-arm64.git
+  # Nyces/shadps4-arm64 main = 2026-10-02 snapshot, the exact base the patch was generated from.
+  CORE_REF: 3d4ff9a9b112cdbec7458b85c76c14db1047f161
+
 jobs:
-  build:
-    name: arm64 core (upstream 0.21.1 + bachata port)
+  core:
+    name: Cross-compile shadps4 0.21.1 (aarch64)
     runs-on: ubuntu-24.04
-    container:
-      image: debian:trixie
-    timeout-minutes: 300
+    timeout-minutes: 360
 
     steps:
-      - name: Bootstrap container
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates curl nodejs
-          git config --global --add safe.directory '*'
-          git --version
+      - name: Checkout port repo
+        uses: actions/checkout@v6
 
-      - name: Free runner disk space
-        # 48 submodules, a full FEX build and cross-build objects do not fit next to the
+      - name: Free disk space
+        # 48 submodules, a full FEXCore build and cross-build objects do not fit next to the
         # preinstalled runner toolchains.
         run: |
-          rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h /
 
-      - name: Checkout port repo
-        uses: actions/checkout@v4
-        with:
-          path: port
-
-      - name: Clone Bachata ARM64 core (with submodules)
+      - name: Fetch pinned Bachata ARM64 core base
         run: |
-          git clone --depth 1 --branch "$CORE_REF" \
-            --recurse-submodules --shallow-submodules --jobs 8 \
-            "$CORE_URL" core
+          set -euo pipefail
+          git init -q core
+          git -C core remote add origin "$CORE_URL"
+          # Fetch by SHA so the base cannot drift under the patch. Falls back to a full branch
+          # fetch in case the server refuses arbitrary-SHA wants.
+          git -C core fetch --no-tags --depth 1 origin "$CORE_REF" ||
+            git -C core fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+          git -C core checkout -q -B main "$CORE_REF"
           git -C core log -1 --format='core base: %H %ci %s'
-          df -h /
 
       - name: Apply the 0.21.1 ARM64 port
-        run: bash port/scripts/apply-port.sh core
+        run: bash scripts/apply-port.sh core
 
       - name: Dump rejects if the port did not apply
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: patch-rejects
           path: |
             core/**/*.rej
             core/**/*.orig
+            core/*.log
           if-no-files-found: ignore
 
-      - name: Record applied diff
+      - name: Build ARM64 core inside Debian trixie container
         run: |
-          git -C core diff --stat | tail -20 | tee port-applied.stat
-          git -C core diff --stat main 2>/dev/null | tail -3 || true
-
-      - name: Install Debian cross-build dependencies
-        working-directory: core
-        run: bash runtime/scripts/install-debian-runtime-deps.sh
-
-      - name: Build arm64 core (FEX + shadps4)
-        working-directory: core
-        run: |
-          bash runtime/scripts/build-shadps4-arm64.sh 2>&1 | tee ../build.log
-          tail -20 ../build.log
+          set -euo pipefail
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace/core \
+            "${DEBIAN_IMAGE}" \
+            bash -c '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends git ca-certificates
+              git config --global --add safe.directory "*"
+              runtime/scripts/install-debian-runtime-deps.sh
+              runtime/scripts/build-shadps4-arm64.sh
+            ' 2>&1 | tee build.log
+          tail -30 build.log
 
       - name: Verify and strip produced ELF
         run: |
-          bin=core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64
-          ls -la "$bin"
-          file "$bin"
-          readelf -h "$bin" | grep -E 'Class|Machine'
-          readelf -l "$bin" | grep -F '/lib/ld-linux-aarch64.so.1'
-          cp "$bin" unstripped-copy
-          aarch64-linux-gnu-strip --strip-debug "$bin"
-          echo "--- after strip ---"
-          ls -la "$bin" unstripped-copy
-          cat core/runtime/build/shadps4-arm64-stage/needed.txt
-          sha256sum "$bin" | tee shadps4-arm64.sha256
+          set -euo pipefail
+          # binutils lives inside the container image, so the strip pass runs there too.
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace/core \
+            "${DEBIAN_IMAGE}" \
+            bash -c '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y --no-install-recommends binutils-aarch64-linux-gnu file
+              bin=runtime/build/shadps4-arm64-stage/bin/shadps4-arm64
+              ls -la "$bin"
+              file "$bin"
+              readelf -h "$bin" | grep -E "Class|Machine"
+              readelf -l "$bin" | grep -F "/lib/ld-linux-aarch64.so.1"
+              before=$(stat -c %s "$bin")
+              aarch64-linux-gnu-strip --strip-debug "$bin"
+              after=$(stat -c %s "$bin")
+              echo "--- strip: ${before} -> ${after} bytes ---"
+              ls -la "$bin"
+              cat runtime/build/shadps4-arm64-stage/needed.txt
+            '
 
       - name: Verify the port actually landed in the binary
         run: |
+          set -euo pipefail
           bin=core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64
           fail=0
-          # CLI contract the Bachata S4+ 0.2.7 frontend relies on when it launches the core.
+          # CLI contract the Bachata S4+ frontend uses when it launches the core.
           for s in '--bachata-socket' '--bachata-storage-root' '--bachata-saf-socket' \
                    '--bachata-saf-token' '--patch-session'; do
             if grep -qaF "$s" "$bin"; then echo "OK   cli $s"; else echo "MISS cli $s"; fail=1; fi
@@ -120,23 +138,28 @@ jobs:
                    'BACHATA_INPUT motion'; do
             if grep -qaF "$s" "$bin"; then echo "OK   glue $s"; else echo "MISS glue $s"; fail=1; fi
           done
-          # Upstream 0.21.1 identity, proving this is not the 2026-06 base.
-          for s in 'libSceJpegDec.sprx'; do
-            if grep -qaF "$s" "$bin"; then echo "OK   base $s"; else echo "MISS base $s"; fail=1; fi
-          done
+          # Upstream 0.21.1 identity, proving this is not the 2026-06 base tree.
+          if grep -qaF 'libSceJpegDec.sprx' "$bin"; then echo "OK   base libSceJpegDec"; else
+            echo "MISS base libSceJpegDec"; fail=1; fi
           [ "$fail" -eq 0 ] || { echo "core does not match expectations"; exit 1; }
 
-      - name: Stage artifacts
+      - name: Stage named artifact
         run: |
-          mkdir -p out
-          cp core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64 out/
-          cp core/runtime/build/shadps4-arm64-stage/needed.txt out/
-          cp shadps4-arm64.sha256 port-applied.stat build.log out/
-          ls -la out
+          set -euo pipefail
+          name="shadps4-arm64-021-$(date -u +%Y-%m-%d)-$(git -C core rev-parse --short HEAD)"
+          echo "ARTIFACT_NAME=$name" >> "$GITHUB_ENV"
+          mkdir -p artifact
+          cp core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64 "artifact/$name"
+          cp core/runtime/build/shadps4-arm64-stage/needed.txt "artifact/$name-needed.txt"
+          sha256sum "artifact/$name" | tee "artifact/$name.sha256"
+          # Keep the log bounded: a full cross-build log runs to tens of MB and the interesting
+          # part is always the tail.
+          tail -c 3000000 build.log > artifact/build.log || true
+          ls -l artifact
 
-      - name: Upload arm64 core
-        uses: actions/upload-artifact@v4
+      - name: Upload ARM64 core artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: shadps4-arm64-021
+          name: ${{ env.ARTIFACT_NAME }}
+          path: artifact/
           if-no-files-found: error
-          path: out/
