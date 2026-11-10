@@ -129,6 +129,56 @@ jobs:
           PATH="$tools:$PATH" glslang-standalone --version
           ls -l "$tools/glslang-standalone"
 
+      - name: Build a host-native protoc for shadnet codegen
+        # Same class of problem as the host shaders: 0.21.1 generates shadnet.pb.{cc,h} through
+        # `COMMAND protobuf::protoc`. That imported target is cross-compiled to aarch64, CMake
+        # will not expand it to a path while cross-compiling, and the rule keeps the bare name
+        # -> `/bin/sh: 1: protobuf::protoc: not found`.
+        #
+        # There is no PATH trick here that stays honest: generated protobuf code is version
+        # locked to the runtime headers, and the tree pins protobuf 36-dev. A distro protoc
+        # would be rejected by the generated `#if PROTOBUF_VERSION` guards, so the generator has
+        # to come from the same source. Build it natively, then point the rule at it. abseil is
+        # pulled by protobuf's own FetchContent at its pinned tag.
+        run: |
+          set -euo pipefail
+          test -f core/externals/protobuf/third_party/utf8_range/CMakeLists.txt || {
+            echo "protobuf third_party/utf8_range is missing; submodules were not fully filled in"
+            exit 1
+          }
+          host=core/runtime/build/protobuf-host
+          cmake -S core/externals/protobuf -B "$host" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=17 \
+            -Dprotobuf_BUILD_TESTS=OFF \
+            -Dprotobuf_BUILD_EXAMPLES=OFF \
+            -Dprotobuf_BUILD_SHARED_LIBS=OFF \
+            -Dprotobuf_BUILD_PROTOC_BINARIES=ON \
+            -Dprotobuf_WITH_ZLIB=OFF \
+            -Dprotobuf_INSTALL=OFF
+          cmake --build "$host" --target protoc -j "$(nproc)"
+          tools=core/runtime/build/host-tools
+          mkdir -p "$tools"
+          ln -sfn ../protobuf-host/protoc "$tools/protoc"
+          "$tools/protoc" --version
+          # Rewrite the one rule that names the imported target. CMAKE_SOURCE_DIR is the repo
+          # root both on the runner and inside the container, so this path stays valid.
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path("core/CMakeLists.txt")
+          text = path.read_text()
+          old = "COMMAND protobuf::protoc"
+          if text.count(old) != 1:
+              sys.exit(f"expected exactly one protobuf::protoc rule, found {text.count(old)}")
+          path.write_text(
+              text.replace(old, "COMMAND ${CMAKE_SOURCE_DIR}/runtime/build/host-tools/protoc")
+          )
+          print("shadnet protoc rule now uses the native generator")
+          PY
+          grep -n "host-tools/protoc" core/CMakeLists.txt
+
       - name: Build ARM64 core inside Debian trixie container
         run: |
           set -euo pipefail
