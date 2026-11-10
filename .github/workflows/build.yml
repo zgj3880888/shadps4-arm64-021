@@ -253,56 +253,6 @@ jobs:
           PY
           grep -n "host-tools/protoc" core/CMakeLists.txt
 
-      - name: Diagnose header sanity
-        # Round 7 failed with every Instance member reported as undeclared even though the
-        # merged tree's vk_instance.h declares them and the patch reproduces that file
-        # byte-for-byte locally. Export the file the container will actually compile, so the
-        # question "is the checkout what we think it is" stops being a guess.
-        run: |
-          set -uo pipefail
-          f=core/src/video_core/renderer_vulkan/vk_instance.h
-          sha256sum "$f"
-          wc -l "$f"
-          echo "--- every vk_instance.h in the tree ---"
-          find core -name 'vk_instance.h' -not -path '*/.git/*' -print -exec sha256sum {} \;
-          echo "--- class body check ---"
-          python3 - "$f" <<'PY'
-          import sys
-          text = open(sys.argv[1]).read()
-          start = text.index("class Instance {")
-          end = text.index("\n};", start)
-          body = text[start:end]
-          print("class body lines:", body.count("\n"))
-          for needle in ("vk::UniqueInstance instance;", "vk::PhysicalDeviceFeatures features;",
-                         "vk::PhysicalDeviceVulkan12Features vk12_features;",
-                         "TracyVkCtx profiler_context"):
-              print(f"  {'OK  ' if needle in body else 'MISS'} {needle}")
-          PY
-          echo "--- head of the class ---"
-          sed -n '20,42p' "$f"
-          echo "--- member block ---"
-          sed -n '520,536p' "$f"
-          echo "--- what imgui_core.h actually includes (error chain said line 8) ---"
-          sed -n '1,14p' core/src/imgui/renderer/imgui_core.h
-          echo "--- do the member types even exist in this vulkan-hpp? ---"
-          for sym in UniqueInstance UniqueDevice UniqueDebugUtilsMessengerEXT; do
-            n=$(grep -rho "using ${sym} =" core/externals/vulkan-headers/include/vulkan/ 2>/dev/null | wc -l)
-            echo "  $sym aliases: $n"
-          done
-          grep -rh "VULKAN_HPP_DISABLE_ENHANCED_MODE" core/externals/vulkan-headers/include/vulkan/ 2>/dev/null | head -3
-          echo "  tracy header: $(ls core/externals/tracy/public/tracy/TracyVulkan.hpp 2>/dev/null || echo MISSING)"
-
-      - name: Upload the headers under suspicion
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: header-sanity
-          path: |
-            core/src/video_core/renderer_vulkan/vk_instance.h
-            core/src/imgui/renderer/imgui_core.h
-            core/src/video_core/renderer_vulkan/vk_platform.h
-          if-no-files-found: warn
-
       - name: Build ARM64 core inside Debian trixie container
         run: |
           set -euo pipefail
