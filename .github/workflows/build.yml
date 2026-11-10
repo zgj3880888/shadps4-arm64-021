@@ -93,6 +93,42 @@ jobs:
             printf '%s: ' "$f"; head -c 24 "$f" | od -c | head -1
           done
 
+      - name: Build a host-native glslang shader compiler
+        # Upstream 0.21.1 compiles every host GLSL shader to a SPIR-V header at build time by
+        # marking the generated header DEPENDS on the in-tree `glslang-standalone` target. Under
+        # cross-compilation CMake deliberately refuses to expand a command target into its
+        # on-disk path - the produced binary would be an aarch64 ELF and cannot run on the x86_64
+        # container - so the generated ninja rule keeps the bare target name and the build dies
+        # with `/bin/sh: 1: glslang-standalone: not found`.
+        #
+        # The fix is to give it a runnable one: build the *same* glslang commit (the submodule
+        # pin) natively on the runner and expose it on PATH under that exact name. SPIR-V output
+        # is architecture independent, and the generator version stays bit-identical to the
+        # tree, so no CMakeLists or port patch has to change.
+        run: |
+          set -euo pipefail
+          cmake -S core/externals/glslang -B core/runtime/build/glslang-host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_GLSLANG_BINARIES=ON \
+            -DENABLE_SPIRV=ON \
+            -DENABLE_SPVREMAPPER=OFF \
+            -DENABLE_HLSL=OFF \
+            -DENABLE_OPT=OFF \
+            -DENABLE_PCH=OFF \
+            -DBUILD_EXTERNAL=OFF \
+            -DGLSLANG_TESTS=OFF \
+            -DGLSLANG_ENABLE_INSTALL=OFF
+          cmake --build core/runtime/build/glslang-host \
+            --target glslang-standalone -j "$(nproc)"
+          # glslang names the executable target `glslang-standalone` but forces
+          # OUTPUT_NAME=glslang, hence the rename. Keep the link relative so it resolves both on
+          # the runner and inside the container at /workspace.
+          tools="$PWD/core/runtime/build/host-tools"
+          mkdir -p "$tools"
+          ln -sfn ../glslang-host/StandAlone/glslang "$tools/glslang-standalone"
+          PATH="$tools:$PATH" glslang-standalone --version
+          ls -l "$tools/glslang-standalone"
+
       - name: Build ARM64 core inside Debian trixie container
         run: |
           set -euo pipefail
@@ -106,6 +142,11 @@ jobs:
               apt-get update
               apt-get install -y --no-install-recommends git ca-certificates
               git config --global --add safe.directory "*"
+              # The host shader generator: native x86_64 glslang built on the runner, exposed
+              # under the target name the project asks for.
+              export PATH="/workspace/core/runtime/build/host-tools:$PATH"
+              command -v glslang-standalone
+              glslang-standalone --version
               bash runtime/scripts/install-debian-runtime-deps.sh
               bash runtime/scripts/build-shadps4-arm64.sh
             ' 2>&1 | tee build.log
@@ -123,7 +164,9 @@ jobs:
               set -euo pipefail
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq
-              apt-get install -y --no-install-recommends binutils-aarch64-linux-gnu file
+              # binutils-aarch64-linux-gnu only ships aarch64-linux-gnu-*; the plain readelf
+              # lives in binutils, and each docker run starts from a clean image.
+              apt-get install -y --no-install-recommends binutils binutils-aarch64-linux-gnu file
               bin=runtime/build/shadps4-arm64-stage/bin/shadps4-arm64
               ls -la "$bin"
               file "$bin"
