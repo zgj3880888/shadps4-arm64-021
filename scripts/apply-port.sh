@@ -39,8 +39,8 @@ while read -r path _sha; do
   exclude_args+=(--exclude="$path")
 done <"$submodule_list"
 
-if git apply --check "${exclude_args[@]}" --exclude=.gitmodules "$patch" 2>/dev/null; then
-  git apply "${exclude_args[@]}" --exclude=.gitmodules "$patch"
+if git apply --check --binary "${exclude_args[@]}" --exclude=.gitmodules "$patch" 2>/dev/null; then
+  git apply --binary "${exclude_args[@]}" --exclude=.gitmodules "$patch"
 else
   echo "port patch does not apply onto this core checkout." >&2
   echo "Expected base: Nyces/shadps4-arm64 main (2026-10-02 snapshot)." >&2
