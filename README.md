@@ -1,89 +1,101 @@
-# Bachata S4 保存修复移植（save_data backup callbacks）
+# shadPS4 → 安卓 ARM64 移植（合上游 0.21.1）
 
-把上游 shadPS4 的存档回调修复（shadps4-emu/shadPS4 PR **#5226**，随 **v0.21.0** 发布）
-移植到安卓端 Bachata S4 的 ARM64 核心源码
-[`zenithblue-oss/shadps4-arm64`](https://github.com/zenithblue-oss/shadps4-arm64)。
+把 **PC 版 shadPS4**（[`shadps4-emu/shadPS4`](https://github.com/shadps4-emu/shadPS4)，0.21.1）
+的模拟器内核移植成 **Android / AArch64** 形态，挂到 **Bachata S4 / S4+** 的安卓壳子里运行。
 
-## 为什么需要它
+上游只有 Windows / Linux / macOS 的 x64 构建，没有任何能直接在手机上跑的目标。这里补的是
+那三块缺口：
 
-PS4《GUNDAM BREAKER 3》（CUSA07651 / CUSA03594 家族）在 `sceSaveDataUmountWithBackup`
-之后会等待一个 **type-1 backup 完成回调**。原实现把
-`sceSaveDataRegisterEventCallback` 写成 stub，回调永远不来，于是：
-
-- 新游戏第一次自动存档卡在 `Saving...`
-- 序章/新手关结算后自动存档卡死，无法结算、无法存档
-- 伴随日志噪音 `file_system.cpp ... sceKernelStat: error = 2`（不是根因）
-
-本补丁按上游实现补齐：回调注册/注销、备份完成后在**模拟线程**（有 guest TLS/栈）
-派发事件、错误码随事件回传、终止流程保护。
-
-## 内容
-
-| 文件 | 改动 |
+| 缺口 | 做法 |
 |---|---|
-| `patches/0001-save-data-backup-completion-callbacks.patch` | 4 个文件，+101/−23，等价于上游 PR #5226 |
-| `scripts/apply-port.sh` | 严格应用补丁（漂移就报错，不做模糊匹配）+ 落地标记校验 |
-| `scripts/repack.sh` | 真正的换二进制脚本：载荷探测（直放 / tar.zst / tar.xz）→ 替换 → 回写哈希清单 → 重打 → zipalign → apksigner |
-| `.github/workflows/build.yml` | 三个作业：交叉编译核心 → 换进官方 APK 并重签 → 导出 APK 布局报告 |
-| `scripts/push-local.sh` | 本机一条命令建仓并推送（已 `git init` 并完成首次提交） |
+| **指令集**：PS4 游戏是 x86-64 代码，ARM 手机执行不了 | 接 **FEX-Emu** 做 JIT guest CPU；HLE 符号经 x86 veneer 注册，guest 回调经 FEX 进入 |
+| **存储**：安卓 scoped storage 不允许按路径重开文件 | **SAF broker**（RPC + `SCM_RIGHTS` 传 fd）+ `SafFsBackend` 挂载 `/app0`、`/hostapp` |
+| **宿主**：手机上没有桌面窗口系统，也没有 SDL 输入轮询 | **Bachata runtime IPC**：socket 上报 running/error/stopped，收手柄与触摸采样，内嵌 X server |
 
-## 状态
+产出一个 ELF64/AArch64 的 `shadps4-arm64`，由安卓前端在 Debian guest 用户态里拉起。
 
-- [x] 补丁已按目标树（2026-08-27 基线）逐处重写，`git apply --check` 通过
-- [ ] 编译验证（走 GitHub Actions 云端构建）
-- [ ] 打进 APK 并在真机验证存档
+## 怎么出包（不需要命令行、不需要 token）
 
-## 云端构建
+1. 在 GitHub 建一个**空**公开仓库（不要勾 README / .gitignore / license）
+2. 把本目录**全部内容**（含 `.github`、`config`、`patches`、`scripts`、`docs`）拖进
+   `Add file → Upload files`，Commit
+3. **Actions** → `build-arm64-core` → Run workflow
+4. 约 60–120 分钟（拉 48 个子模块 + 编 FEX + 编内核）
 
-工作流 `build-savefix-core`（`.github/workflows/build.yml`）：
+产物在 **Actions → 该次运行 → Artifacts → `shadps4-arm64-021`**：
 
-1. 在 `debian:trixie` 容器里拉取核心源码 + 子模块，应用补丁
-2. 跑核心仓库自带的 `runtime/scripts/install-debian-runtime-deps.sh`（arm64 多架构依赖）
-3. 跑核心仓库自带的 `runtime/scripts/build-shadps4-arm64.sh` 交叉编译
-4. 校验产物是 `ELF64 / AArch64` 且解释器为 `/lib/ld-linux-aarch64.so.1`，上传 `shadps4-arm64` + diff + 构建日志
+| 文件 | 用途 |
+|---|---|
+| `shadps4-arm64` | 换进 APK 的内核（ELF64 / AArch64，已 strip debug） |
+| `needed.txt` | 它依赖的 `.so` 清单，核对 APK 里 guest rootfs 是否齐 |
+| `shadps4-arm64.sha256` | 校验值 |
+| `port-applied.stat` / `build.log` | 审计与排错 |
 
-**为什么必须在 Debian 容器里跑**：上游构建脚本硬编码了
-`CMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu`，这是 Debian 交叉工具链生成的路径；
-Ubuntu runner 的 arm64 多架构库在 `/usr/lib/aarch64-linux-gnu`，直接跑会对不上。
+## 怎么换进 APK
 
-另外两个作业：
+官方 APK 里**没有**独立的 `bin/shadps4-arm64`。内核在
+`assets/runtime/runtime.zip` 内名为 `host/shadps4-arm64-fex`，并且有多处哈希要同步：
 
-- `repack-apk`（依赖 `build`）：下载官方 APK，用 `scripts/repack.sh` 把新内核换进去、
-  回写哈希清单、`zipalign` + `apksigner` 重签，产出可直接安装的 `patched.apk`
-- `inspect-apk`：只导出官方 APK 的内部布局报告（`apk-layout`），不改任何东西
-
-
-## 推送到 GitHub
-
-目录已经 `git init` 并完成首次提交，推上去就会自动触发构建：
-
-```bash
-# 方式 A：装了 GitHub CLI（推荐，一条命令建仓+推送）
-bash scripts/push-local.sh
-
-# 方式 B：手工
-git remote add origin https://github.com/<你的账号>/bachata-s4-savefix.git
-git push -u origin main
+```
+host/shadps4-arm64-fex                            ← 被替换的主体
+usr/share/bachata/guest-runtime.json              {"variant","revision","sha256"}
+usr/share/bachata/guest-runtime.txt               variant=… / revision=… / sha256=…
+usr/share/bachata/shadps4-arm64-fex-needed.txt    ld-linux + libc + …
+assets/runtime/manifest.json                      每个条目的 path/size/sha256
 ```
 
-推上去后在 Actions 里看 `build-savefix-core`，产物在 Artifacts → `shadps4-arm64-savefix`。
+`runtimeVersion` 是把每个条目的 `path\0sha256\n` 顺序喂进 sha256 取前 12 位十六进制，
+所以改完内核必须重算，否则前端会拒绝加载。
 
-## 换掉 APK 里的二进制（说明）
-
-Bachata S4 的 APK 由私有 Gradle 前端打包，公开源码里**没有** `android/` 前端，
-所以只能走「官方 APK + 替换运行时二进制 + 重新签名」这条路：
+`scripts/repack-runtime.py` 一次做完（换条目 + 重算哈希 + 重签名）：
 
 ```bash
-unzip app.apk -d apk/                 # 找到 <runtime 容器>/bin/shadps4-arm64
-#   → 解包容器、替换 bin/shadps4-arm64、按原压缩格式回包
-zipalign -p -f 4 apk-unsigned.apk apk-aligned.apk
-apksigner sign --ks debug.keystore --out app-signed.apk apk-aligned.apk
+python scripts/repack-runtime.py BachataS4Plus.apk shadps4-arm64 patched.apk \
+    --needed needed.txt --label bachata-021
 ```
 
-若应用内部对运行时做了完整性校验（`components.lock.json` / 摘要清单），
-还需要同步更新对应哈希，否则运行时会拒绝加载。
+先看 APK 内部结构：`python scripts/repack-runtime.py --inspect BachataS4Plus.apk`
 
-## 许可
+## 这个仓库里的东西
 
-补丁内容源自 shadPS4（GPL-2.0-or-later）与 Bachata S4 的公开导出源码，
-同样以 GPL-2.0-or-later 提供。本仓库**不包含**任何 PS4 游戏、固件、密钥或 APK 本体。
+```
+config/gitmodules          合并后的 .gitmodules（上游 0.21.1 + Bachata 专有子模块并集）
+config/submodule-shas.txt  48 个子模块的精确 revision
+patches/0001-upstream-021-arm64-port.patch   整树移植差分（720 文件，7.1 MB）
+scripts/apply-port.sh      在 Bachata 基树上应用该差分 + 对齐子模块 + 校验移植标记
+scripts/repack-runtime.py  把新内核换进官方 APK
+```
+
+差分是 `git diff --binary arm64main HEAD` 生成的，**必须严格应用**（`git apply --check`
+通过才继续）：它把整棵树从 2026-06-20 的上游基线搬到 0.21.1，模糊应用会留下半合并的
+FEX/SAF 胶水，编出来的内核能链接但起不来。
+
+子模块不放进差分里，而是由 `config/submodule-shas.txt` 逐条对齐 —— 上游把
+`externals/dear_imgui` 改名成 `externals/imgui`，还新增了 protobuf / zstd / zarchive /
+abseil-cpp，`git apply` 没法给一个尚不存在的 checkout 重定向 gitlink。
+
+## 移植里最容易踩的三处
+
+1. **合并基线**。Bachata 树那个「Publish hardened ARM64 client source」是整树覆盖提交，
+   git 记录的父提交不是真实基线。真实基线是 2026-06-20 的 `5ddd87d7`，用
+   `git replace --graft` 改父提交后，3 路合并冲突从 181 降到 89。
+2. **guest 信号必须经 FEX**。guest 装的 `SIGSEGV` / `SIGUSR1`（Unity GC 用它做
+   stop-the-world）handler 是 x86 代码，直接在 ARM 上 `call` 会跳进未映射内存。
+   统一走 `Core::Fex::DeliverGuestOrbisSignal` 排到 HLE 边界执行。
+3. **SAF 下不能按路径重开文件**。`std::filesystem::copy_file`、`IOFile(path)` 这类调用在
+   scoped storage 里会 `EACCES`。要走 `Common::FS::SetFdOpenHook` 拿已打开的 fd。
+
+## 已知边界
+
+- 上游 0.21.1 的 `video_core` / `shader_recompiler` 全部取官方实现。Bachata 树里的
+  Adreno 专用调优（tile manager scratch 池、`vk_presenter` 诊断、`vk_instance` 扩展
+  可选化）**没有回植** —— 先保证能编能跑，再按实测瓶颈逐条加回。
+- `VK_EXT_robustness2` 在上游是硬要求，Adreno/Mali 驱动不一定暴露；当前降级为警告。
+- 桌面专属路径（`SetIcon` 的 X11 图标属性、SDL 手柄扫描）在 `ENABLE_BACHATA_RUNTIME`
+  下短路，安卓侧改由 IPC 提供输入。
+
+## 历史文档
+
+`docs/PORT-NOTES.md` 是上一轮「只移植 save_data 备份回调」工作的推理记录。该补丁的
+结论已被上游 0.21.1 内置（`OrbisSaveDataEventCallback` / `DispatchBackupEvent`），
+本仓库不再包含它，只保留文档作参考。

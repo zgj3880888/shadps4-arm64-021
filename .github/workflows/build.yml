@@ -1,12 +1,18 @@
-name: build-savefix-core
+name: build-arm64-core
 
-# Builds the Bachata S4 ARM64 emulator core with the save_data backup-callback
-# port applied, using the exact same build path the upstream project uses:
-# Debian trixie + arm64 multiarch + runtime/scripts/build-shadps4-arm64.sh.
+# Builds the Bachata S4 ARM64 emulator core: the whole Bachata ARM64 port (FEX guest CPU +
+# Android SAF broker + managed patch sessions) rebased onto upstream shadps4-emu/shadPS4
+# 0.21.1. Only the resulting core binary is produced here; the APK swap is a separate step.
 #
-# The upstream build script hardcodes CMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu,
-# which only exists on Debian with the cross toolchain installed, so the job runs
-# inside a debian:trixie container instead of on the Ubuntu runner directly.
+# Three facts drive the shape of this workflow:
+#   1. The core is cross-compiled with the project's own Debian multiarch script, which
+#      hardcodes CMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu, so it must run inside a
+#      debian:trixie container rather than on the Ubuntu runner.
+#   2. The base checkout must be the Bachata ARM64 tree (it supplies runtime/scripts,
+#      runtime/locks, FEX orchestration and the Android-specific sources). The port diff is
+#      applied on top, so this job never needs write access to the upstream repo.
+#   3. The APK has no standalone bin/shadps4-arm64: the guest userland is one stored zip at
+#      assets/runtime/runtime.zip and the core lives inside it as host/shadps4-arm64-fex.
 
 on:
   push:
@@ -14,7 +20,9 @@ on:
   workflow_dispatch:
 
 env:
-  CORE_URL: https://github.com/zenithblue-oss/shadps4-arm64.git
+  # Base tree. Its runtime/ orchestration and FEX pin are reused as-is; the port patch replaces
+  # the emulator sources with the upstream 0.21.1 ones plus the ARM64/Android glue.
+  CORE_URL: https://github.com/Nyces/shadps4-arm64.git
   CORE_REF: main
 
 permissions:
@@ -22,7 +30,7 @@ permissions:
 
 jobs:
   build:
-    name: arm64 core + save_data port
+    name: arm64 core (upstream 0.21.1 + bachata port)
     runs-on: ubuntu-24.04
     container:
       image: debian:trixie
@@ -32,12 +40,13 @@ jobs:
       - name: Bootstrap container
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates curl
+          apt-get install -y --no-install-recommends git ca-certificates curl nodejs
           git config --global --add safe.directory '*'
           git --version
 
       - name: Free runner disk space
-        # 子模块 + 交叉编译产物体积很大，先清掉 runner 上用不到的预装工具链
+        # 48 submodules, a full FEX build and cross-build objects do not fit next to the
+        # preinstalled runner toolchains.
         run: |
           rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h /
@@ -52,121 +61,82 @@ jobs:
           git clone --depth 1 --branch "$CORE_REF" \
             --recurse-submodules --shallow-submodules --jobs 8 \
             "$CORE_URL" core
-          git -C core log -1 --format='core HEAD: %H %ci %s'
+          git -C core log -1 --format='core base: %H %ci %s'
+          df -h /
 
-      - name: Apply save_data port
+      - name: Apply the 0.21.1 ARM64 port
         run: bash port/scripts/apply-port.sh core
+
+      - name: Dump rejects if the port did not apply
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-rejects
+          path: |
+            core/**/*.rej
+            core/**/*.orig
+          if-no-files-found: ignore
 
       - name: Record applied diff
         run: |
-          git -C core diff --stat | tee port-applied.stat
-          git -C core diff -- src/core/libraries/save_data > port-applied.diff
+          git -C core diff --stat | tail -20 | tee port-applied.stat
+          git -C core diff --stat main 2>/dev/null | tail -3 || true
 
       - name: Install Debian cross-build dependencies
         working-directory: core
         run: bash runtime/scripts/install-debian-runtime-deps.sh
 
-      - name: Build arm64 core
+      - name: Build arm64 core (FEX + shadps4)
         working-directory: core
         run: |
           bash runtime/scripts/build-shadps4-arm64.sh 2>&1 | tee ../build.log
           tail -20 ../build.log
 
-      - name: Verify produced ELF
+      - name: Verify and strip produced ELF
         run: |
           bin=core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64
           ls -la "$bin"
           file "$bin"
           readelf -h "$bin" | grep -E 'Class|Machine'
           readelf -l "$bin" | grep -F '/lib/ld-linux-aarch64.so.1'
+          cp "$bin" unstripped-copy
+          aarch64-linux-gnu-strip --strip-debug "$bin"
+          echo "--- after strip ---"
+          ls -la "$bin" unstripped-copy
           cat core/runtime/build/shadps4-arm64-stage/needed.txt
           sha256sum "$bin" | tee shadps4-arm64.sha256
+
+      - name: Verify the port actually landed in the binary
+        run: |
+          bin=core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64
+          fail=0
+          # CLI contract the Bachata S4+ 0.2.7 frontend relies on when it launches the core.
+          for s in '--bachata-socket' '--bachata-storage-root' '--bachata-saf-socket' \
+                   '--bachata-saf-token' '--patch-session'; do
+            if grep -qaF "$s" "$bin"; then echo "OK   cli $s"; else echo "MISS cli $s"; fail=1; fi
+          done
+          # Android platform glue: SAF broker, FEX guest CPU, managed patch sessions.
+          for s in 'saf-mirror' 'PATCH_SESSION_LOAD' 'PATCH_APPLIED' 'BACHATA_FEX_SIGNAL' \
+                   'BACHATA_INPUT motion'; do
+            if grep -qaF "$s" "$bin"; then echo "OK   glue $s"; else echo "MISS glue $s"; fail=1; fi
+          done
+          # Upstream 0.21.1 identity, proving this is not the 2026-06 base.
+          for s in 'libSceJpegDec.sprx'; do
+            if grep -qaF "$s" "$bin"; then echo "OK   base $s"; else echo "MISS base $s"; fail=1; fi
+          done
+          [ "$fail" -eq 0 ] || { echo "core does not match expectations"; exit 1; }
 
       - name: Stage artifacts
         run: |
           mkdir -p out
           cp core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64 out/
           cp core/runtime/build/shadps4-arm64-stage/needed.txt out/
-          cp shadps4-arm64.sha256 port-applied.stat port-applied.diff build.log out/
+          cp shadps4-arm64.sha256 port-applied.stat build.log out/
           ls -la out
 
-      - name: Upload patched core binary
+      - name: Upload arm64 core
         uses: actions/upload-artifact@v4
         with:
-          name: shadps4-arm64-savefix
+          name: shadps4-arm64-021
           if-no-files-found: error
           path: out/
-
-  repack-apk:
-    name: Repack official APK with patched core
-    needs: build
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Fetch patched core
-        uses: actions/download-artifact@v4
-        with:
-          name: shadps4-arm64-savefix
-          path: out
-
-      - name: Install repack tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends unzip zip python3 zstd xz-utils
-          sudo apt-get install -y --no-install-recommends zipalign apksigner || \
-            echo "zipalign/apksigner 不可用，将输出未签名包"
-
-      - name: Download official APK
-        env:
-          APK_VERSION: v0.2.5
-        run: |
-          curl -sSL --retry 3 -o app.apk \
-            "https://github.com/JICA98/Bachata-S4/releases/download/${APK_VERSION}/bachatas4-0.2.5-release.apk"
-          sha256sum app.apk | tee apk.sha256
-
-      - name: Repack and sign
-        run: |
-          chmod +x out/shadps4-arm64 scripts/repack.sh
-          bash scripts/repack.sh app.apk out/shadps4-arm64 patched.apk 2>&1 | tee repack.log
-          sha256sum patched.apk | tee patched.sha256
-
-      - name: Upload repacked APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: bachata-s4-savefix-apk
-          if-no-files-found: warn
-          path: |
-            patched.apk
-            patched.sha256
-            repack.log
-            apk.sha256
-
-  inspect-apk:
-    name: Inspect official APK layout
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download official APK
-        env:
-          APK_VERSION: v0.2.5
-        run: |
-          curl -sSL --retry 3 -o app.apk \
-            "https://github.com/JICA98/Bachata-S4/releases/download/${APK_VERSION}/bachatas4-0.2.5-release.apk"
-          sha256sum app.apk | tee apk.sha256
-          ls -la app.apk
-
-      - name: Dump layout
-        run: |
-          sudo apt-get update && sudo apt-get install -y unzip file
-          bash scripts/repack.sh app.apk /dev/null report-only.apk > layout.log 2>&1 || true
-          cat layout.log
-
-      - name: Upload layout report
-        uses: actions/upload-artifact@v4
-        with:
-          name: apk-layout
-          path: |
-            layout.log
-            apk.sha256
