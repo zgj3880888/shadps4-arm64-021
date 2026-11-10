@@ -56,10 +56,17 @@ while read -r path sha; do
   git update-index --add --cacheinfo "160000,$sha,$path"
 done <"$submodule_list"
 
-# The rename leaves the old checkout behind as an untracked directory; CMake no longer
-# references it, but git would otherwise keep reporting it as a stray submodule.
-git submodule deinit -f -- externals/dear_imgui >/dev/null 2>&1 || true
-rm -rf externals/dear_imgui
+# 0.21.1 renamed externals/dear_imgui to externals/imgui. The old gitlink survives the apply
+# because its diff hunk is excluded above, and `git submodule sync` aborts with
+# "No url found for submodule path" on any index gitlink that .gitmodules no longer declares --
+# even though later steps would have replaced it. Drop such entries before syncing.
+git ls-files -s | awk '$1 == "160000" { print $4 }' | while read -r stale; do
+  case "$stale" in externals/*) ;; *) continue ;; esac
+  grep -qF "path = $stale" .gitmodules && continue
+  echo "dropping stale gitlink $stale"
+  git update-index --force-remove "$stale"
+  rm -rf -- "$stale"
+done
 
 git submodule sync --recursive
 
