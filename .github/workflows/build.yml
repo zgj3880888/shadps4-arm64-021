@@ -93,6 +93,80 @@ jobs:
             printf '%s: ' "$f"; head -c 24 "$f" | od -c | head -1
           done
 
+      - name: Repair the merge artifacts the port patch carries
+        # The rebase cost four files a closing brace. Consequences are not local: in
+        # vk_instance.h the missing `}` nested the rest of the class inside a function body,
+        # so every later getter lost sight of its members and clang reported a dozen
+        # "undeclared identifier" errors that pointed nowhere near the real line. The same
+        # swallowing happened in CreateDevice(), inside Emulator::Run, and
+        # symbols_resolver.cpp kept the brace of a function that no longer exists.
+        #
+        # Each repair asserts an exact match count so a patch refresh that already carries
+        # the fix fails here instead of silently double-fixing.
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          def repair(path, old, new):
+              p = pathlib.Path(path)
+              data = p.read_bytes()
+              nl = b"\r\n" if b"\r\n" in data[:4000] else b"\n"
+              o = old.replace(b"\n", nl)
+              n = new.replace(b"\n", nl)
+              found = data.count(o)
+              if found != 1:
+                  sys.exit(f"{path}: expected exactly 1 match, found {found}")
+              p.write_bytes(data.replace(o, n))
+              print(f"repaired {path}")
+
+          # 1. vk_instance.h: IsVertexAttributeDivisorSupported() never closed, so the whole
+          #    member block below it stopped being class members.
+          repair("core/src/video_core/renderer_vulkan/vk_instance.h",
+                 b"        return vertex_attribute_divisor;\n"
+                 b"    /// Returns the maximum size of a single VkDeviceMemory",
+                 b"        return vertex_attribute_divisor;\n"
+                 b"    }\n\n"
+                 b"    /// Returns the maximum size of a single VkDeviceMemory")
+
+          # 2. vk_instance.cpp: same shape inside CreateDevice()'s unlink cascade.
+          repair("core/src/video_core/renderer_vulkan/vk_instance.cpp",
+                 b"        device_chain.unlink<vk::PhysicalDeviceVertexAttributeDivisorFeatures>();\n"
+                 b"    if (!maintenance_5) {",
+                 b"        device_chain.unlink<vk::PhysicalDeviceVertexAttributeDivisorFeatures>();\n"
+                 b"    }\n"
+                 b"    if (!maintenance_5) {")
+
+          # 3. emulator.cpp: the failure path lost upstream's quick_exit and its closing brace.
+          repair("core/src/emulator.cpp",
+                 b"                onRuntimeStopped(1);\n"
+                 b"            }\n"
+                 b"#endif\n\n"
+                 b"#ifdef ENABLE_DISCORD_RPC",
+                 b"                onRuntimeStopped(1);\n"
+                 b"            }\n"
+                 b"#endif\n"
+                 b"            std::quick_exit(0);\n"
+                 b"        }\n\n"
+                 b"#ifdef ENABLE_DISCORD_RPC")
+
+          # 4. symbols_resolver.cpp: GenerateName() was removed, its closing brace was not.
+          repair("core/src/core/loader/symbols_resolver.cpp",
+                 b"#endif\n}\n\nconst SymbolRecord* SymbolsResolver::FindSymbol",
+                 b"#endif\n\nconst SymbolRecord* SymbolsResolver::FindSymbol")
+          PY
+          echo "--- brace balance of the repaired files ---"
+          python3 - <<'PY'
+          import pathlib
+          for f in ("core/src/video_core/renderer_vulkan/vk_instance.h",
+                    "core/src/video_core/renderer_vulkan/vk_instance.cpp",
+                    "core/src/emulator.cpp",
+                    "core/src/core/loader/symbols_resolver.cpp"):
+              b = pathlib.Path(f).read_bytes()
+              print(f"  {b.count(b'{') - b.count(b'}'):+d}  {f}")
+          PY
+
       - name: Build a host-native glslang shader compiler
         # Upstream 0.21.1 compiles every host GLSL shader to a SPIR-V header at build time by
         # marking the generated header DEPENDS on the in-tree `glslang-standalone` target. Under
