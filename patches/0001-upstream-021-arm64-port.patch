@@ -26524,7 +26524,7 @@ index 3a5240f1..264d7f23 100644
 +
 +} // namespace Common::Log
 diff --git a/src/common/logging/formatter.h b/src/common/logging/formatter.h
-index fad8451e..abc62dcb 100644
+index fad8451e..3d921313 100644
 --- a/src/common/logging/formatter.h
 +++ b/src/common/logging/formatter.h
 @@ -1,42 +1,47 @@
@@ -26605,14 +26605,14 @@ index fad8451e..abc62dcb 100644
 +} // namespace fmt
 +
 +template <>
-+struct fmt::formatter<fmt::UTF<std::string_view>, char> {
++struct fmt::formatter<fmt::UTF<std::string_view>, char> : formatter<std::string_view> {
 +    template <typename FormatContext>
 +    auto format(const UTF<std::string_view>& wrapper, FormatContext& ctx) const
 +        -> decltype(ctx.out()) {
-+        // fmt 12 turned formatter<basic_string_view> into a generic native_formatter whose
-+        // format() is a member template, so the inherited name is not found without extra
-+        // `template`/`this->` plumbing. Formatting through format_to sidesteps the base class
-+        // entirely and produces the same output.
++        // fmt 12 lowered formatter<basic_string_view> to a generic native_formatter whose
++        // format() is a member template. Inheriting it still gives us parse(), which fmt
++        // requires, but the inherited format() name is not visible for a dependent lookup --
++        // so format through format_to and leave the base class in place for parse().
 +        return fmt::format_to(ctx.out(), "{}", wrapper.data);
 +    }
  };
@@ -286711,7 +286711,7 @@ index 00000000..734a9692
 +constexpr int ORBIS_VOICE_ERROR_TOPOLOGY = 0x804E0807;
 +constexpr int ORBIS_VOICE_ERROR_RESOURCE_INSUFFICIENT = 0x804E0808;
 diff --git a/src/core/linker.cpp b/src/core/linker.cpp
-index e887b31f..fd331b42 100644
+index e887b31f..40aaa9ed 100644
 --- a/src/core/linker.cpp
 +++ b/src/core/linker.cpp
 @@ -21,10 +21,14 @@
@@ -286917,7 +286917,7 @@ index e887b31f..fd331b42 100644
      ASSERT_MSG(library && module, "Unable to find library and module");
  
      Loader::SymbolResolver sr{};
-@@ -793,7 +858,7 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
+@@ -793,11 +858,11 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
  
      const auto aeronid = AeroLib::FindByNid(sr.name.c_str());
      if (sym_type == Loader::SymbolType::Object) {
@@ -286926,7 +286926,17 @@ index e887b31f..fd331b42 100644
          return_info->virtual_address = 0;
  #ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
      } else if (sym_type == Loader::SymbolType::Function) {
-@@ -809,15 +874,22 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
+-        return_info->name = aeronid ? aeronid->name : "Unknown function";
++        return_info->symbol.name = aeronid ? aeronid->name : "Unknown function";
+         return_info->virtual_address = 0;
+         if (record != nullptr && record->hle_fallback) {
+             return_info->hle_adapter = record->hle_adapter;
+@@ -805,19 +870,26 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
+             return_info->hle_adapter = m_hle_symbols.AddUnsupportedFunction(sr);
+         }
+         LOG_WARNING(Core_Linker, "FEX: unresolved HLE {} uses temporary ENOSYS fallback",
+-                    return_info->name);
++                    return_info->symbol.name);
          return false;
  #endif
      } else if (aeronid) {
@@ -290167,7 +290177,7 @@ index 9fc93b47..874ccf9e 100644
  private:
      std::vector<SymbolRecord> m_symbols;
 diff --git a/src/core/memory.cpp b/src/core/memory.cpp
-index 7e17cdc3..6320ecb1 100644
+index 7e17cdc3..46dfae32 100644
 --- a/src/core/memory.cpp
 +++ b/src/core/memory.cpp
 @@ -1,6 +1,7 @@
@@ -290408,7 +290418,7 @@ index 7e17cdc3..6320ecb1 100644
          if (virtual_addr == -1) {
              // No suitable memory areas to map to
              return ORBIS_KERNEL_ERROR_ENOMEM;
-@@ -762,9 +797,40 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
+@@ -762,16 +797,47 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
      auto& new_vma = new_vma_handle->second;
      new_vma.fd = fd;
      auto mapped_addr = new_vma.base;
@@ -290451,6 +290461,14 @@ index 7e17cdc3..6320ecb1 100644
  
  #ifndef _WIN32
      // PS4 pages are 16KB and mmap zero-fills the mapped tail past EOF. Host pages
+     // are 4KB, so host pages fully past EOF raise SIGBUS on access (e.g. IL2CPP
+     // reading past the end of global-metadata.dat). Back that tail with anonymous
+     // zero pages to match PS4 semantics.
+-    const u64 file_size = file->f.GetSize();
++    const u64 file_size = file->GetSize();
+     const u64 file_bytes =
+         file_size > static_cast<u64>(phys_addr) ? file_size - static_cast<u64>(phys_addr) : 0;
+     const u64 host_page = static_cast<u64>(sysconf(_SC_PAGESIZE));
 @@ -862,7 +928,10 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
      }
  
@@ -321381,853 +321399,93 @@ index 00000000..e1aa714d
 +
 +} // namespace Shader::Backend::SPIRV
 diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
-index 2d088a46..6bb42839 100644
+index 2d088a46..13b43011 100644
 --- a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
 +++ b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
-@@ -1,422 +1,421 @@
--// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
--// SPDX-License-Identifier: GPL-2.0-or-later
--
--#include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
--#include "shader_recompiler/backend/spirv/fma_split_diag.h"
--#include "shader_recompiler/backend/spirv/recip_refine_fix.h"
--#include "shader_recompiler/backend/spirv/spirv_emit_context.h"
--
--namespace Shader::Backend::SPIRV {
--
--Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
+@@ -9,7 +9,12 @@
+ namespace Shader::Backend::SPIRV {
+ 
+ Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
 -    ctx.Decorate(op, spv::Decoration::NoContraction);
--    return op;
--}
--
--Id EmitFPAbs32(EmitContext& ctx, Id value) {
--    return ctx.OpFAbs(ctx.F32[1], value);
--}
--
--Id EmitFPAbs64(EmitContext& ctx, Id value) {
--    return ctx.OpFAbs(ctx.F64[1], value);
--}
--
--Id EmitFPAdd32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
--    return Decorate(ctx, inst, ctx.OpFAdd(ctx.F32[1], a, b));
--}
--
--Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
--    return Decorate(ctx, inst, ctx.OpFAdd(ctx.F64[1], a, b));
--}
--
--Id EmitFPSub32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
--    return Decorate(ctx, inst, ctx.OpFSub(ctx.F32[1], a, b));
--}
--
--Id EmitFPFma32(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
--    if (ShouldSplitFmaNoContraction(ctx.info.pgm_hash, ctx.info.stage)) {
--        const Id mul{ctx.OpFMul(ctx.F32[1], a, b)};
--        ctx.Decorate(mul, spv::Decoration::NoContraction);
--        const Id add{ctx.OpFAdd(ctx.F32[1], mul, c)};
--        ctx.Decorate(add, spv::Decoration::NoContraction);
--        ++ctx.fma_split_replaced;
--        ++ctx.fma_split_mul_emitted;
--        ++ctx.fma_split_add_emitted;
--        return add;
--    }
--    return Decorate(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c));
--}
--
--Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
--    return Decorate(ctx, inst, ctx.OpFma(ctx.F64[1], a, b, c));
--}
--
--Id EmitFPMax32(EmitContext& ctx, Id a, Id b) {
--    return ctx.OpFMax(ctx.F32[1], a, b);
--}
--
--Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
--    return ctx.OpFMax(ctx.F64[1], a, b);
--}
--
--Id EmitFPMin32(EmitContext& ctx, Id a, Id b) {
--    return ctx.OpFMin(ctx.F32[1], a, b);
--}
--
--Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
--    return ctx.OpFMin(ctx.F64[1], a, b);
--}
--
--Id EmitFPMinTri32(EmitContext& ctx, Id a, Id b, Id c) {
--    if (ctx.profile.supports_trinary_minmax) {
--        return ctx.OpFMin3AMD(ctx.F32[1], a, b, c);
--    }
--    return ctx.OpFMin(ctx.F32[1], a, ctx.OpFMin(ctx.F32[1], b, c));
--}
--
--Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
--    if (ctx.profile.supports_trinary_minmax) {
--        return ctx.OpFMax3AMD(ctx.F32[1], a, b, c);
--    }
--    return ctx.OpFMax(ctx.F32[1], a, ctx.OpFMax(ctx.F32[1], b, c));
--}
--
--Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
--    if (ctx.profile.supports_trinary_minmax) {
--        return ctx.OpFMid3AMD(ctx.F32[1], a, b, c);
--    }
--    const Id mmx{ctx.OpFMin(ctx.F32[1], ctx.OpFMax(ctx.F32[1], a, b), c)};
--    return ctx.OpFMax(ctx.F32[1], ctx.OpFMin(ctx.F32[1], a, b), mmx);
--}
--
--Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
--    return Decorate(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
--}
--
--Id EmitFPMul64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
--    return Decorate(ctx, inst, ctx.OpFMul(ctx.F64[1], a, b));
--}
--
--Id EmitFPDiv32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
--    return Decorate(ctx, inst, ctx.OpFDiv(ctx.F32[1], a, b));
--}
--
--Id EmitFPDiv64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
--    return Decorate(ctx, inst, ctx.OpFDiv(ctx.F64[1], a, b));
--}
--
--Id EmitFPNeg32(EmitContext& ctx, Id value) {
--    return ctx.OpFNegate(ctx.F32[1], value);
--}
--
--Id EmitFPNeg64(EmitContext& ctx, Id value) {
--    return ctx.OpFNegate(ctx.F64[1], value);
--}
--
--Id EmitFPSin(EmitContext& ctx, Id value) {
--    return ctx.OpSin(ctx.F32[1], ctx.OpFMul(ctx.F32[1], ctx.pi_x2, value));
--}
--
--Id EmitFPCos(EmitContext& ctx, Id value) {
--    return ctx.OpCos(ctx.F32[1], ctx.OpFMul(ctx.F32[1], ctx.pi_x2, value));
--}
--
--Id EmitFPExp2(EmitContext& ctx, Id value) {
--    return ctx.OpExp2(ctx.F32[1], value);
--}
--
--Id EmitFPPow(EmitContext& ctx, Id x, Id y) {
--    return ctx.OpPow(ctx.F32[1], x, y);
--}
--
--Id EmitFPLdexp(EmitContext& ctx, Id value, Id exp) {
--    return ctx.OpLdexp(ctx.F32[1], value, exp);
--}
--
--Id EmitFPLog2(EmitContext& ctx, Id value) {
--    return ctx.OpLog2(ctx.F32[1], value);
--}
--
--Id EmitFPRecip32(EmitContext& ctx, Id value) {
--    const Id raw = ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), value);
--    if (!ShouldRefineRecip32(ctx.info.pgm_hash, ctx.info.stage)) {
--        return raw;
--    }
--    // One Newton step pins the reciprocal inside GCN v_rcp_f32's <= 1 ulp
--    // envelope regardless of how coarsely the driver approximates OpFDiv.
--    // Special inputs (±0, ±Inf, NaN, denormal overflow) make the refinement
--    // non-finite; those fall back to the raw division result, which already
--    // matches GCN special semantics.
--    const Id x_r = ctx.OpFMul(ctx.F32[1], value, raw);
--    const Id corr = ctx.OpFSub(ctx.F32[1], ctx.ConstF32(2.0f), x_r);
--    const Id refined = ctx.OpFMul(ctx.F32[1], raw, corr);
--    const Id bad = ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], refined),
--                                   ctx.OpIsInf(ctx.U1[1], refined));
--    return ctx.OpSelect(ctx.F32[1], bad, raw, refined);
--}
--
--Id EmitFPRecip64(EmitContext& ctx, Id value) {
--    return ctx.OpFDiv(ctx.F64[1], ctx.Constant(ctx.F64[1], f64{1.0}), value);
--}
--
--Id EmitFPRecipSqrt32(EmitContext& ctx, Id value) {
--    return ctx.OpInverseSqrt(ctx.F32[1], value);
--}
--
--Id EmitFPRecipSqrt64(EmitContext& ctx, Id value) {
--    return ctx.OpInverseSqrt(ctx.F64[1], value);
--}
--
--Id EmitFPSqrt(EmitContext& ctx, Id value) {
--    return ctx.OpSqrt(ctx.F32[1], value);
--}
--
--Id EmitFPSaturate32(EmitContext& ctx, Id value) {
--    const Id zero{ctx.ConstF32(f32{0.0})};
--    const Id one{ctx.ConstF32(f32{1.0})};
--    return ctx.OpFClamp(ctx.F32[1], value, zero, one);
--}
--
--Id EmitFPSaturate64(EmitContext& ctx, Id value) {
--    const Id zero{ctx.Constant(ctx.F64[1], f64{0.0})};
--    const Id one{ctx.Constant(ctx.F64[1], f64{1.0})};
--    return ctx.OpFClamp(ctx.F64[1], value, zero, one);
--}
--
--Id EmitFPClamp32(EmitContext& ctx, Id value, Id min_value, Id max_value) {
--    return ctx.OpFClamp(ctx.F32[1], value, min_value, max_value);
--}
--
--Id EmitFPClamp64(EmitContext& ctx, Id value, Id min_value, Id max_value) {
--    return ctx.OpFClamp(ctx.F64[1], value, min_value, max_value);
--}
--
--Id EmitFPRoundEven32(EmitContext& ctx, Id value) {
--    return ctx.OpRoundEven(ctx.F32[1], value);
--}
--
--Id EmitFPRoundEven64(EmitContext& ctx, Id value) {
--    return ctx.OpRoundEven(ctx.F64[1], value);
--}
--
--Id EmitFPFloor32(EmitContext& ctx, Id value) {
--    return ctx.OpFloor(ctx.F32[1], value);
--}
--
--Id EmitFPFloor64(EmitContext& ctx, Id value) {
--    return ctx.OpFloor(ctx.F64[1], value);
--}
--
--Id EmitFPCeil32(EmitContext& ctx, Id value) {
--    return ctx.OpCeil(ctx.F32[1], value);
--}
--
--Id EmitFPCeil64(EmitContext& ctx, Id value) {
--    return ctx.OpCeil(ctx.F64[1], value);
--}
--
--Id EmitFPTrunc32(EmitContext& ctx, Id value) {
--    return ctx.OpTrunc(ctx.F32[1], value);
--}
--
--Id EmitFPTrunc64(EmitContext& ctx, Id value) {
--    return ctx.OpTrunc(ctx.F64[1], value);
--}
--
--Id EmitFPFract32(EmitContext& ctx, Id value) {
--    return ctx.OpFract(ctx.F32[1], value);
--}
--
--Id EmitFPFract64(EmitContext& ctx, Id value) {
--    return ctx.OpFract(ctx.F64[1], value);
--}
--
--Id EmitFPFrexpSig32(EmitContext& ctx, Id value) {
--    const auto frexp = ctx.OpFrexpStruct(ctx.frexp_result_f32, value);
--    return ctx.OpCompositeExtract(ctx.F32[1], frexp, 0);
--}
--
--Id EmitFPFrexpSig64(EmitContext& ctx, Id value) {
--    const auto frexp = ctx.OpFrexpStruct(ctx.frexp_result_f64, value);
--    return ctx.OpCompositeExtract(ctx.F64[1], frexp, 0);
--}
--
--Id EmitFPFrexpExp32(EmitContext& ctx, Id value) {
--    const auto frexp = ctx.OpFrexpStruct(ctx.frexp_result_f32, value);
--    return ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.S32[1], frexp, 1));
--}
--
--Id EmitFPFrexpExp64(EmitContext& ctx, Id value) {
--    const auto frexp = ctx.OpFrexpStruct(ctx.frexp_result_f64, value);
--    return ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.S32[1], frexp, 1));
--}
--
--Id EmitFPOrdEqual16(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdEqual32(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdEqual64(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordEqual16(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordEqual32(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordEqual64(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdNotEqual16(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdNotEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdNotEqual32(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdNotEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdNotEqual64(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdNotEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordNotEqual16(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordNotEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordNotEqual32(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordNotEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordNotEqual64(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordNotEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdLessThan16(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdLessThan(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdLessThan32(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdLessThan(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdLessThan64(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdLessThan(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordLessThan16(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordLessThan(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordLessThan32(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordLessThan(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordLessThan64(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordLessThan(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdGreaterThan16(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdGreaterThan(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdGreaterThan32(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdGreaterThan(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdGreaterThan64(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdGreaterThan(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordGreaterThan16(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordGreaterThan(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordGreaterThan32(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordGreaterThan(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordGreaterThan64(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordGreaterThan(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdLessThanEqual16(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdLessThanEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdLessThanEqual32(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdLessThanEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdLessThanEqual64(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdLessThanEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordLessThanEqual16(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordLessThanEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordLessThanEqual32(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordLessThanEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordLessThanEqual64(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordLessThanEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdGreaterThanEqual16(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdGreaterThanEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdGreaterThanEqual32(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdGreaterThanEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPOrdGreaterThanEqual64(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFOrdGreaterThanEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordGreaterThanEqual16(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordGreaterThanEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordGreaterThanEqual32(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordGreaterThanEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPUnordGreaterThanEqual64(EmitContext& ctx, Id lhs, Id rhs) {
--    return ctx.OpFUnordGreaterThanEqual(ctx.U1[1], lhs, rhs);
--}
--
--Id EmitFPIsNan16(EmitContext& ctx, Id value) {
--    return ctx.OpIsNan(ctx.U1[1], value);
--}
--
--Id EmitFPIsNan32(EmitContext& ctx, Id value) {
--    return ctx.OpIsNan(ctx.U1[1], value);
--}
--
--Id EmitFPIsNan64(EmitContext& ctx, Id value) {
--    return ctx.OpIsNan(ctx.U1[1], value);
--}
--
--Id EmitFPIsInf32(EmitContext& ctx, Id value) {
--    return ctx.OpIsInf(ctx.U1[1], value);
--}
--
--Id EmitFPIsInf64(EmitContext& ctx, Id value) {
--    return ctx.OpIsInf(ctx.U1[1], value);
--}
--
--void EmitFPCmpClass32(EmitContext&) {
--    UNREACHABLE();
--}
--
--} // namespace Shader::Backend::SPIRV
-+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+
-+#include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
-+#include "shader_recompiler/backend/spirv/fma_split_diag.h"
-+#include "shader_recompiler/backend/spirv/recip_refine_fix.h"
-+#include "shader_recompiler/backend/spirv/spirv_emit_context.h"
-+
-+namespace Shader::Backend::SPIRV {
-+
-+Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
 +    // Pre-rasterization stages keep it, so position math stays the same across pipelines.
 +    const bool can_contract = ctx.profile.fast_shader_math && (ctx.sw_stage == SwStage::Fragment ||
 +                                                               ctx.sw_stage == SwStage::Compute);
 +    if (!can_contract) {
 +        ctx.Decorate(op, spv::Decoration::NoContraction);
 +    }
-+    return op;
-+}
-+
-+Id EmitFPAbs32(EmitContext& ctx, Id value) {
-+    return ctx.OpFAbs(ctx.F32[1], value);
-+}
-+
-+Id EmitFPAbs64(EmitContext& ctx, Id value) {
-+    return ctx.OpFAbs(ctx.F64[1], value);
-+}
-+
-+Id EmitFPAdd32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-+    return Decorate(ctx, inst, ctx.OpFAdd(ctx.F32[1], a, b));
-+}
-+
-+Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-+    return Decorate(ctx, inst, ctx.OpFAdd(ctx.F64[1], a, b));
-+}
-+
-+Id EmitFPSub32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-+    return Decorate(ctx, inst, ctx.OpFSub(ctx.F32[1], a, b));
-+}
-+
-+Id EmitFPFma32(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
-+    if (ShouldSplitFmaNoContraction(ctx.info.pgm_hash, ctx.info.stage)) {
-+        const Id mul{ctx.OpFMul(ctx.F32[1], a, b)};
-+        ctx.Decorate(mul, spv::Decoration::NoContraction);
-+        const Id add{ctx.OpFAdd(ctx.F32[1], mul, c)};
-+        ctx.Decorate(add, spv::Decoration::NoContraction);
-+        ++ctx.fma_split_replaced;
-+        ++ctx.fma_split_mul_emitted;
-+        ++ctx.fma_split_add_emitted;
-+        return add;
-+    }
-+    return Decorate(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c));
-+}
-+
-+Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
-+    return Decorate(ctx, inst, ctx.OpFma(ctx.F64[1], a, b, c));
-+}
-+
-+Id EmitFPMax32(EmitContext& ctx, Id a, Id b) {
-+    return ctx.OpFMax(ctx.F32[1], a, b);
-+}
-+
-+Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
-+    return ctx.OpFMax(ctx.F64[1], a, b);
-+}
-+
-+Id EmitFPMin32(EmitContext& ctx, Id a, Id b) {
-+    return ctx.OpFMin(ctx.F32[1], a, b);
-+}
-+
-+Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
-+    return ctx.OpFMin(ctx.F64[1], a, b);
-+}
-+
-+Id EmitFPMinTri32(EmitContext& ctx, Id a, Id b, Id c) {
+     return op;
+ }
+ 
+@@ -34,7 +39,7 @@ Id EmitFPSub32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
+ }
+ 
+ Id EmitFPFma32(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
+-    if (ShouldSplitFmaNoContraction(ctx.info.pgm_hash, ctx.info.stage)) {
++    if (ShouldSplitFmaNoContraction(ctx.info.pgm_hash, ctx.info.hw_stage)) {
+         const Id mul{ctx.OpFMul(ctx.F32[1], a, b)};
+         ctx.Decorate(mul, spv::Decoration::NoContraction);
+         const Id add{ctx.OpFAdd(ctx.F32[1], mul, c)};
+@@ -68,25 +73,21 @@ Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
+ }
+ 
+ Id EmitFPMinTri32(EmitContext& ctx, Id a, Id b, Id c) {
+-    if (ctx.profile.supports_trinary_minmax) {
+-        return ctx.OpFMin3AMD(ctx.F32[1], a, b, c);
+-    }
+-    return ctx.OpFMin(ctx.F32[1], a, ctx.OpFMin(ctx.F32[1], b, c));
 +    return ctx.OpNMin(ctx.F32[1], a, ctx.OpNMin(ctx.F32[1], b, c));
-+}
-+
-+Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
+ }
+ 
+ Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
+-    if (ctx.profile.supports_trinary_minmax) {
+-        return ctx.OpFMax3AMD(ctx.F32[1], a, b, c);
+-    }
+-    return ctx.OpFMax(ctx.F32[1], a, ctx.OpFMax(ctx.F32[1], b, c));
 +    return ctx.OpNMax(ctx.F32[1], a, ctx.OpNMax(ctx.F32[1], b, c));
-+}
-+
-+Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
+ }
+ 
+ Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
+-    if (ctx.profile.supports_trinary_minmax) {
+-        return ctx.OpFMid3AMD(ctx.F32[1], a, b, c);
+-    }
 +    const Id is_nan{ctx.OpLogicalOr(
 +        ctx.U1[1], ctx.OpIsNan(ctx.U1[1], a),
 +        ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], b), ctx.OpIsNan(ctx.U1[1], c)))};
-+    const Id mmx{ctx.OpFMin(ctx.F32[1], ctx.OpFMax(ctx.F32[1], a, b), c)};
+     const Id mmx{ctx.OpFMin(ctx.F32[1], ctx.OpFMax(ctx.F32[1], a, b), c)};
+-    return ctx.OpFMax(ctx.F32[1], ctx.OpFMin(ctx.F32[1], a, b), mmx);
 +    const Id med3{ctx.OpFMax(ctx.F32[1], ctx.OpFMin(ctx.F32[1], a, b), mmx)};
 +    const Id min3{ctx.OpNMin(ctx.F32[1], a, ctx.OpNMin(ctx.F32[1], b, c))};
 +    return ctx.OpSelect(ctx.F32[1], is_nan, min3, med3);
-+}
-+
-+Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-+    return Decorate(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
-+}
-+
-+Id EmitFPMul64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-+    return Decorate(ctx, inst, ctx.OpFMul(ctx.F64[1], a, b));
-+}
-+
-+Id EmitFPDiv32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-+    return Decorate(ctx, inst, ctx.OpFDiv(ctx.F32[1], a, b));
-+}
-+
-+Id EmitFPDiv64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-+    return Decorate(ctx, inst, ctx.OpFDiv(ctx.F64[1], a, b));
-+}
-+
-+Id EmitFPNeg32(EmitContext& ctx, Id value) {
-+    return ctx.OpFNegate(ctx.F32[1], value);
-+}
-+
-+Id EmitFPNeg64(EmitContext& ctx, Id value) {
-+    return ctx.OpFNegate(ctx.F64[1], value);
-+}
-+
-+Id EmitFPSin(EmitContext& ctx, Id value) {
-+    return ctx.OpSin(ctx.F32[1], ctx.OpFMul(ctx.F32[1], ctx.pi_x2, value));
-+}
-+
-+Id EmitFPCos(EmitContext& ctx, Id value) {
-+    return ctx.OpCos(ctx.F32[1], ctx.OpFMul(ctx.F32[1], ctx.pi_x2, value));
-+}
-+
-+Id EmitFPExp2(EmitContext& ctx, Id value) {
-+    return ctx.OpExp2(ctx.F32[1], value);
-+}
-+
-+Id EmitFPPow(EmitContext& ctx, Id x, Id y) {
-+    return ctx.OpPow(ctx.F32[1], x, y);
-+}
-+
-+Id EmitFPLdexp(EmitContext& ctx, Id value, Id exp) {
-+    return ctx.OpLdexp(ctx.F32[1], value, exp);
-+}
-+
-+Id EmitFPLog2(EmitContext& ctx, Id value) {
-+    return ctx.OpLog2(ctx.F32[1], value);
-+}
-+
-+Id EmitFPRecip32(EmitContext& ctx, Id value) {
-+    const Id raw = ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), value);
-+    if (!ShouldRefineRecip32(ctx.info.pgm_hash, ctx.info.stage)) {
-+        return raw;
-+    }
-+    // One Newton step pins the reciprocal inside GCN v_rcp_f32's <= 1 ulp
-+    // envelope regardless of how coarsely the driver approximates OpFDiv.
-+    // Special inputs (±0, ±Inf, NaN, denormal overflow) make the refinement
-+    // non-finite; those fall back to the raw division result, which already
-+    // matches GCN special semantics.
-+    const Id x_r = ctx.OpFMul(ctx.F32[1], value, raw);
-+    const Id corr = ctx.OpFSub(ctx.F32[1], ctx.ConstF32(2.0f), x_r);
-+    const Id refined = ctx.OpFMul(ctx.F32[1], raw, corr);
-+    const Id bad = ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], refined),
-+                                   ctx.OpIsInf(ctx.U1[1], refined));
-+    return ctx.OpSelect(ctx.F32[1], bad, raw, refined);
-+}
-+
-+Id EmitFPRecip64(EmitContext& ctx, Id value) {
-+    return ctx.OpFDiv(ctx.F64[1], ctx.Constant(ctx.F64[1], f64{1.0}), value);
-+}
-+
-+Id EmitFPRecipSqrt32(EmitContext& ctx, Id value) {
-+    return ctx.OpInverseSqrt(ctx.F32[1], value);
-+}
-+
-+Id EmitFPRecipSqrt64(EmitContext& ctx, Id value) {
-+    return ctx.OpInverseSqrt(ctx.F64[1], value);
-+}
-+
-+Id EmitFPSqrt(EmitContext& ctx, Id value) {
-+    return ctx.OpSqrt(ctx.F32[1], value);
-+}
-+
-+Id EmitFPSaturate32(EmitContext& ctx, Id value) {
+ }
+ 
+ Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
+@@ -139,7 +140,7 @@ Id EmitFPLog2(EmitContext& ctx, Id value) {
+ 
+ Id EmitFPRecip32(EmitContext& ctx, Id value) {
+     const Id raw = ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), value);
+-    if (!ShouldRefineRecip32(ctx.info.pgm_hash, ctx.info.stage)) {
++    if (!ShouldRefineRecip32(ctx.info.pgm_hash, ctx.info.hw_stage)) {
+         return raw;
+     }
+     // One Newton step pins the reciprocal inside GCN v_rcp_f32's <= 1 ulp
+@@ -172,15 +173,13 @@ Id EmitFPSqrt(EmitContext& ctx, Id value) {
+ }
+ 
+ Id EmitFPSaturate32(EmitContext& ctx, Id value) {
+-    const Id zero{ctx.ConstF32(f32{0.0})};
+-    const Id one{ctx.ConstF32(f32{1.0})};
+-    return ctx.OpFClamp(ctx.F32[1], value, zero, one);
 +    return ctx.OpNClamp(ctx.F32[1], value, ctx.f32_zero_value, ctx.f32_one_value);
-+}
-+
-+Id EmitFPSaturate64(EmitContext& ctx, Id value) {
-+    const Id zero{ctx.Constant(ctx.F64[1], f64{0.0})};
-+    const Id one{ctx.Constant(ctx.F64[1], f64{1.0})};
+ }
+ 
+ Id EmitFPSaturate64(EmitContext& ctx, Id value) {
+     const Id zero{ctx.Constant(ctx.F64[1], f64{0.0})};
+     const Id one{ctx.Constant(ctx.F64[1], f64{1.0})};
+-    return ctx.OpFClamp(ctx.F64[1], value, zero, one);
 +    return ctx.OpNClamp(ctx.F64[1], value, zero, one);
-+}
-+
-+Id EmitFPClamp32(EmitContext& ctx, Id value, Id min_value, Id max_value) {
-+    return ctx.OpFClamp(ctx.F32[1], value, min_value, max_value);
-+}
-+
-+Id EmitFPClamp64(EmitContext& ctx, Id value, Id min_value, Id max_value) {
-+    return ctx.OpFClamp(ctx.F64[1], value, min_value, max_value);
-+}
-+
-+Id EmitFPRoundEven32(EmitContext& ctx, Id value) {
-+    return ctx.OpRoundEven(ctx.F32[1], value);
-+}
-+
-+Id EmitFPRoundEven64(EmitContext& ctx, Id value) {
-+    return ctx.OpRoundEven(ctx.F64[1], value);
-+}
-+
-+Id EmitFPFloor32(EmitContext& ctx, Id value) {
-+    return ctx.OpFloor(ctx.F32[1], value);
-+}
-+
-+Id EmitFPFloor64(EmitContext& ctx, Id value) {
-+    return ctx.OpFloor(ctx.F64[1], value);
-+}
-+
-+Id EmitFPCeil32(EmitContext& ctx, Id value) {
-+    return ctx.OpCeil(ctx.F32[1], value);
-+}
-+
-+Id EmitFPCeil64(EmitContext& ctx, Id value) {
-+    return ctx.OpCeil(ctx.F64[1], value);
-+}
-+
-+Id EmitFPTrunc32(EmitContext& ctx, Id value) {
-+    return ctx.OpTrunc(ctx.F32[1], value);
-+}
-+
-+Id EmitFPTrunc64(EmitContext& ctx, Id value) {
-+    return ctx.OpTrunc(ctx.F64[1], value);
-+}
-+
-+Id EmitFPFract32(EmitContext& ctx, Id value) {
-+    return ctx.OpFract(ctx.F32[1], value);
-+}
-+
-+Id EmitFPFract64(EmitContext& ctx, Id value) {
-+    return ctx.OpFract(ctx.F64[1], value);
-+}
-+
-+Id EmitFPFrexpSig32(EmitContext& ctx, Id value) {
-+    const auto frexp = ctx.OpFrexpStruct(ctx.frexp_result_f32, value);
-+    return ctx.OpCompositeExtract(ctx.F32[1], frexp, 0);
-+}
-+
-+Id EmitFPFrexpSig64(EmitContext& ctx, Id value) {
-+    const auto frexp = ctx.OpFrexpStruct(ctx.frexp_result_f64, value);
-+    return ctx.OpCompositeExtract(ctx.F64[1], frexp, 0);
-+}
-+
-+Id EmitFPFrexpExp32(EmitContext& ctx, Id value) {
-+    const auto frexp = ctx.OpFrexpStruct(ctx.frexp_result_f32, value);
-+    return ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.S32[1], frexp, 1));
-+}
-+
-+Id EmitFPFrexpExp64(EmitContext& ctx, Id value) {
-+    const auto frexp = ctx.OpFrexpStruct(ctx.frexp_result_f64, value);
-+    return ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.S32[1], frexp, 1));
-+}
-+
-+Id EmitFPOrdEqual16(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdEqual32(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdEqual64(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordEqual16(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordEqual32(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordEqual64(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdNotEqual16(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdNotEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdNotEqual32(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdNotEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdNotEqual64(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdNotEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordNotEqual16(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordNotEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordNotEqual32(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordNotEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordNotEqual64(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordNotEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdLessThan16(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdLessThan(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdLessThan32(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdLessThan(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdLessThan64(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdLessThan(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordLessThan16(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordLessThan(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordLessThan32(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordLessThan(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordLessThan64(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordLessThan(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdGreaterThan16(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdGreaterThan(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdGreaterThan32(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdGreaterThan(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdGreaterThan64(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdGreaterThan(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordGreaterThan16(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordGreaterThan(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordGreaterThan32(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordGreaterThan(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordGreaterThan64(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordGreaterThan(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdLessThanEqual16(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdLessThanEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdLessThanEqual32(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdLessThanEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdLessThanEqual64(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdLessThanEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordLessThanEqual16(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordLessThanEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordLessThanEqual32(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordLessThanEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordLessThanEqual64(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordLessThanEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdGreaterThanEqual16(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdGreaterThanEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdGreaterThanEqual32(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdGreaterThanEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPOrdGreaterThanEqual64(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFOrdGreaterThanEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordGreaterThanEqual16(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordGreaterThanEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordGreaterThanEqual32(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordGreaterThanEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPUnordGreaterThanEqual64(EmitContext& ctx, Id lhs, Id rhs) {
-+    return ctx.OpFUnordGreaterThanEqual(ctx.U1[1], lhs, rhs);
-+}
-+
-+Id EmitFPIsNan16(EmitContext& ctx, Id value) {
-+    return ctx.OpIsNan(ctx.U1[1], value);
-+}
-+
-+Id EmitFPIsNan32(EmitContext& ctx, Id value) {
-+    return ctx.OpIsNan(ctx.U1[1], value);
-+}
-+
-+Id EmitFPIsNan64(EmitContext& ctx, Id value) {
-+    return ctx.OpIsNan(ctx.U1[1], value);
-+}
-+
-+Id EmitFPIsInf32(EmitContext& ctx, Id value) {
-+    return ctx.OpIsInf(ctx.U1[1], value);
-+}
-+
-+Id EmitFPIsInf64(EmitContext& ctx, Id value) {
-+    return ctx.OpIsInf(ctx.U1[1], value);
-+}
-+
-+void EmitFPCmpClass32(EmitContext&) {
-+    UNREACHABLE();
-+}
-+
-+} // namespace Shader::Backend::SPIRV
+ }
+ 
+ Id EmitFPClamp32(EmitContext& ctx, Id value, Id min_value, Id max_value) {
 diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
 index 87d03eef..28904ba8 100644
 --- a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
@@ -326056,6 +325314,36 @@ index cd28ee5c..1e45fe76 100644
 +}
 +
 +} // namespace Shader::Backend::SPIRV
+diff --git a/src/shader_recompiler/backend/spirv/fma_split_diag.h b/src/shader_recompiler/backend/spirv/fma_split_diag.h
+index f3b811a4..79da136c 100644
+--- a/src/shader_recompiler/backend/spirv/fma_split_diag.h
++++ b/src/shader_recompiler/backend/spirv/fma_split_diag.h
+@@ -23,8 +23,8 @@ inline constexpr u32 kSpvDecorationNoContraction = 42;
+ inline constexpr u32 kSpvExecutionModeContractionOff = 31;
+ inline constexpr u32 kGLSLstd450Fma = 50;
+ 
+-[[nodiscard]] inline bool ShouldSplitFmaNoContraction(u64 pgm_hash, Stage stage) {
+-    if (stage != Stage::Vertex) {
++[[nodiscard]] inline bool ShouldSplitFmaNoContraction(u64 pgm_hash, HwStage stage) {
++    if (stage != HwStage::Vertex) {
+         return false;
+     }
+     return pgm_hash == kDsrSkinnedVs032fd69c || pgm_hash == kDsrSkinnedVs27904a0c;
+diff --git a/src/shader_recompiler/backend/spirv/recip_refine_fix.h b/src/shader_recompiler/backend/spirv/recip_refine_fix.h
+index c770334b..022b3e47 100644
+--- a/src/shader_recompiler/backend/spirv/recip_refine_fix.h
++++ b/src/shader_recompiler/backend/spirv/recip_refine_fix.h
+@@ -19,8 +19,8 @@ namespace Shader::Backend::SPIRV {
+ /// compiler validated. Outside it the quotient is wrong, every vertex of the
+ /// walking mesh is fetched at quotient x 80 bytes off, and the mesh explodes
+ /// while idle (different divisor values) stays intact.
+-[[nodiscard]] inline bool ShouldRefineRecip32(u64 pgm_hash, Stage stage) {
+-    if (stage != Stage::Vertex) {
++[[nodiscard]] inline bool ShouldRefineRecip32(u64 pgm_hash, HwStage stage) {
++    if (stage != HwStage::Vertex) {
+         return false;
+     }
+     return pgm_hash == kDsrSkinnedVs032fd69c || pgm_hash == kDsrSkinnedVs27904a0c;
 diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
 index dcb75bc0..4694f968 100644
 --- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
@@ -328665,856 +327953,86 @@ index dcb75bc0..4694f968 100644
 +
 +} // namespace Shader::Backend::SPIRV
 diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
-index b5a416a4..ef2589fd 100644
+index b5a416a4..12e8382f 100644
 --- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
 +++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
-@@ -1,422 +1,424 @@
--// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
--// SPDX-License-Identifier: GPL-2.0-or-later
--
--#pragma once
--
--#include <array>
--#include <unordered_map>
--#include <sirit/sirit.h>
--
--#include "shader_recompiler/backend/bindings.h"
--#include "shader_recompiler/info.h"
--#include "shader_recompiler/ir/value.h"
--#include "shader_recompiler/profile.h"
--
--namespace Shader::Backend::SPIRV {
--
--using Sirit::Id;
--
--struct VectorIds {
--    [[nodiscard]] Id& operator[](u32 index) {
--        return ids[index - 1];
--    }
--
--    [[nodiscard]] const Id& operator[](u32 index) const {
--        return ids[index - 1];
--    }
--
--    [[nodiscard]] Id& Get(u32 index) {
--        return ids[index - 1];
--    }
--
--    [[nodiscard]] const Id& Get(u32 index) const {
--        return ids[index - 1];
--    }
--
--    std::array<Id, 4> ids;
--};
--
--class EmitContext final : public Sirit::Module {
--public:
--    explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info, Info& info,
--                         Bindings& binding);
--    ~EmitContext();
--
--    Id Def(const IR::Value& value);
--
--    void DefineBufferProperties();
--    void DefineAmdPerVertexAttribs();
--    void DefineWorkgroupIndex();
--
--    [[nodiscard]] Id DefineInput(Id type, std::optional<u32> location = std::nullopt,
--                                 std::optional<spv::BuiltIn> builtin = std::nullopt) {
--        const Id input_id{DefineVariable(type, builtin, spv::StorageClass::Input)};
--        if (location) {
--            Decorate(input_id, spv::Decoration::Location, *location);
--        }
--        return input_id;
--    }
--
--    [[nodiscard]] Id DefineOutput(Id type, std::optional<u32> location = std::nullopt,
--                                  std::optional<spv::BuiltIn> builtin = std::nullopt) {
--        const Id output_id{DefineVariable(type, builtin, spv::StorageClass::Output)};
--        if (location) {
--            Decorate(output_id, spv::Decoration::Location, *location);
--        }
--        return output_id;
--    }
--
--    [[nodiscard]] Id DefineUniformConst(Id type, u32 set, u32 binding, bool readonly = false) {
--        const Id uniform_id{DefineVar(type, spv::StorageClass::UniformConstant)};
--        Decorate(uniform_id, spv::Decoration::DescriptorSet, set);
--        Decorate(uniform_id, spv::Decoration::Binding, binding);
--        if (readonly) {
--            Decorate(uniform_id, spv::Decoration::NonWritable);
--        }
--        return uniform_id;
--    }
--
--    template <bool global = true>
--    [[nodiscard]] Id DefineVar(Id type, spv::StorageClass storage_class,
--                               std::optional<Id> initializer = std::nullopt) {
--        const Id pointer_type_id{TypePointer(storage_class, type)};
--        return global ? AddGlobalVariable(pointer_type_id, storage_class, initializer)
--                      : AddLocalVariable(pointer_type_id, storage_class, initializer);
--    }
--
--    [[nodiscard]] Id DefineVariable(Id type, std::optional<spv::BuiltIn> builtin,
--                                    spv::StorageClass storage_class,
--                                    std::optional<Id> initializer = std::nullopt) {
--        const Id id{DefineVar(type, storage_class, initializer)};
--        if (builtin) {
--            Decorate(id, spv::Decoration::BuiltIn, *builtin);
--        }
--        interfaces.push_back(id);
--        return id;
--    }
--
--    [[nodiscard]] Id ConstU32(u32 value) {
--        return Constant(U32[1], value);
--    }
--
--    template <typename... Args>
--    [[nodiscard]] Id ConstU32(Args&&... values) {
--        constexpr u32 size = static_cast<u32>(sizeof...(values));
--        static_assert(size >= 2);
--        const std::array constituents{Constant(U32[1], values)...};
--        const Id type = size <= 4 ? U32[size] : TypeArray(U32[1], ConstU32(size));
--        return ConstantComposite(type, constituents);
--    }
--
--    [[nodiscard]] Id ConstS32(s32 value) {
--        return Constant(S32[1], value);
--    }
--
--    template <typename... Args>
--    [[nodiscard]] Id ConstS32(Args&&... values) {
--        constexpr u32 size = static_cast<u32>(sizeof...(values));
--        static_assert(size >= 2);
--        const std::array constituents{Constant(S32[1], values)...};
--        const Id type = size <= 4 ? S32[size] : TypeArray(S32[1], ConstU32(size));
--        return ConstantComposite(type, constituents);
--    }
--
--    [[nodiscard]] Id ConstF32(f32 value) {
--        return Constant(F32[1], value);
--    }
--
--    template <typename... Args>
--    [[nodiscard]] Id ConstF32(Args... values) {
--        constexpr u32 size = static_cast<u32>(sizeof...(values));
--        static_assert(size >= 2);
--        const std::array constituents{Constant(F32[1], values)...};
--        const Id type = size <= 4 ? F32[size] : TypeArray(F32[1], ConstU32(size));
--        return ConstantComposite(type, constituents);
--    }
--
--    inline Id AddLabel() {
--        last_label = Module::AddLabel();
--        return last_label;
--    }
--
--    inline Id AddLabel(Id label) {
--        last_label = Module::AddLabel(label);
--        return last_label;
--    }
--
--    Id EmitDwordMemoryRead(Id address, auto&& fallback) {
--        const Id available_label = OpLabel();
--        const Id fallback_label = OpLabel();
--        const Id merge_label = OpLabel();
--
--        const Id addr = OpFunctionCall(U64, get_bda_pointer, address);
--        const Id is_available = OpINotEqual(U1[1], addr, u64_zero_value);
--        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
--        OpBranchConditional(is_available, available_label, fallback_label);
--
--        // Available
--        AddLabel(available_label);
--        const Id addr_ptr = OpConvertUToPtr(physical_pointer_type_u32, addr);
--        const Id result = OpLoad(U32[1], addr_ptr, spv::MemoryAccessMask::Aligned, 4u);
--        OpBranch(merge_label);
--
--        // Fallback
--        AddLabel(fallback_label);
--        const Id fallback_result = fallback();
--        OpBranch(merge_label);
--
--        // Merge
--        AddLabel(merge_label);
--        const Id final_result =
--            OpPhi(U32[1], fallback_result, fallback_label, result, available_label);
--        return final_result;
--    }
--
--    Id EmitSharedMemoryAccess(const Id result_type, const Id shared_mem, const Id index) {
--        if (std::popcount(static_cast<u32>(info.shared_types)) > 1) {
--            return OpAccessChain(result_type, shared_mem, u32_zero_value, index);
--        }
--        // Workgroup layout struct omitted.
--        return OpAccessChain(result_type, shared_mem, index);
--    }
--
--    Id EmitFlatbufferLoad(Id flatbuf_offset) {
--        const auto& flatbuf_buffer{buffers[flatbuf_index]};
--        ASSERT(flatbuf_buffer.binding >= 0 && flatbuf_buffer.buffer_type == BufferType::Flatbuf);
--        const auto [flatbuf_buffer_id, flatbuf_pointer_type] =
--            flatbuf_buffer.aliases[u32(PointerType::U32)];
--        const auto ptr{
--            OpAccessChain(flatbuf_pointer_type, flatbuf_buffer_id, u32_zero_value, flatbuf_offset)};
--        return OpLoad(U32[1], ptr);
--    }
--
--    Info& info;
--    const RuntimeInfo& runtime_info;
--    const Profile& profile;
+@@ -193,8 +193,12 @@ public:
+     Info& info;
+     const RuntimeInfo& runtime_info;
+     const Profile& profile;
 -    Stage stage;
 -    LogicalStage l_stage{};
--    u32 fma_split_replaced{};
--    u32 fma_split_mul_emitted{};
--    u32 fma_split_add_emitted{};
--
--    Id last_label{};
--
--    Id void_id{};
--    Id U8{};
--    Id S8{};
--    Id U16{};
--    Id S16{};
--    Id U64{};
--    VectorIds F16{};
--    VectorIds F32{};
--    VectorIds F64{};
--    VectorIds S32{};
--    VectorIds U32{};
--    VectorIds U1{};
--
--    Id full_result_i32x2;
--    Id full_result_u32x2;
--    Id frexp_result_f32;
--    Id frexp_result_f64;
--
--    Id pi_x2;
--
--    Id true_value{};
--    Id false_value{};
--    Id u8_one_value{};
--    Id u8_zero_value{};
--    Id u16_zero_value{};
--    Id u32_one_value{};
--    Id u32_zero_value{};
--    Id f32_zero_value{};
--    Id u64_one_value{};
--    Id u64_zero_value{};
--
--    Id shared_u16{};
--    Id shared_u32{};
--    Id shared_u64{};
--
--    Id input_u32{};
--    Id input_f32{};
--    Id input_s32{};
--    Id output_u32{};
--    Id output_f32{};
--    Id output_s32{};
--
--    Id gl_in{};
--
--    boost::container::small_vector<Id, 16> interfaces;
--
--    Id output_position{};
--    Id output_point_size{};
--    Id output_layer{};
--    Id output_viewport_index{};
--    Id primitive_id{};
--    Id vertex_index{};
--    Id instance_id{};
--    Id push_data_block{};
--    Id base_vertex{};
--    Id frag_coord{};
--    Id front_facing{};
--    Id frag_depth{};
--    Id stencil_ref{};
--    Id sample_mask{};
--    Id sample_index{};
--    Id clip_distances{};
--    Id cull_distances{};
--    u32 clip_distance_count{};
--    u32 cull_distance_count{};
--
--    Id patch_vertices{};
--    Id output_tess_level_outer{};
--    Id output_tess_level_inner{};
--    Id tess_coord;
--    std::array<Id, 30> patches{};
--
--    Id workgroup_id{};
--    Id num_workgroups_id{};
--    Id workgroup_index_id{};
--    Id local_invocation_id{};
--    Id invocation_id{};
--    Id subgroup_local_invocation_id{};
--    Id image_u32{};
--    Id image_f32{};
--
--    Id shared_memory_u16{};
--    Id shared_memory_u32{};
--    Id shared_memory_u64{};
--
--    Id shared_memory_u16_type{};
--    Id shared_memory_u32_type{};
--    Id shared_memory_u64_type{};
--
--    Id bary_coord_smooth{};
--    Id bary_coord_smooth_centroid{};
--    Id bary_coord_smooth_sample{};
--    Id bary_coord_nopersp{};
--    Id bary_coord_nopersp_sample{};
--
--    struct TextureDefinition {
--        const VectorIds* data_types;
--        Id id;
--        Id sampled_type;
--        Id image_type;
--        AmdGpu::ImageType view_type;
--        bool is_1d_hosted_as_2d = false;
--        bool is_integer = false;
--        bool is_storage = false;
--        MipStorageFallbackMode mip_fallback_mode{};
--    };
--
--    enum class PointerType : u32 {
--        U8,
--        U16,
--        U32,
--        F32,
--        U64,
--        F64,
--        NumAlias,
--    };
--
--    enum class PointerSize : u32 {
--        B8,
--        B16,
--        B32,
--        B64,
--        NumClass,
--    };
--
--    struct BufferSpv {
--        Id id;
--        Id pointer_type;
--    };
--
--    struct BufferDefinition {
--        u32 binding;
--        BufferType buffer_type;
--        std::array<Id, u32(PointerSize::NumClass)> offsets;
--        std::array<BufferSpv, u32(PointerType::NumAlias)> aliases;
--
--        template <class Self>
--        auto& Alias(this Self& self, PointerType alias) {
--            return self.aliases[u32(alias)];
--        }
--
--        template <class Self>
--        auto& Offset(this Self& self, PointerSize size) {
--            return self.offsets[u32(size)];
--        }
--    };
--
--    Bindings& binding;
--    boost::container::small_vector<Id, 16> buf_type_ids;
--    boost::container::small_vector<BufferDefinition, 16> buffers;
--    boost::container::small_vector<TextureDefinition, 8> images;
--    boost::container::small_vector<Id, 4> samplers;
--    std::unordered_map<u32, Id> first_to_last_label_map;
--
--    size_t flatbuf_index{};
--    size_t bda_pagetable_index{};
--    size_t fault_buffer_index{};
--    Id physical_pointer_type_u32;
--
--    Id sampler_type{};
--    Id sampler_pointer_type{};
--
--    struct SpirvAttribute {
--        union {
--            Id id;
--            std::array<Id, 3> id_array;
--        };
--        Id pointer_type;
--        Id component_type;
--        u32 num_components;
--        bool is_integer{};
--        bool is_loaded{};
--        bool is_array{};
--    };
--    Id input_attr_array;
--    Id output_attr_array;
--    std::array<SpirvAttribute, IR::NumParams> input_params{};
--    std::array<SpirvAttribute, IR::NumParams> output_params{};
--    std::array<SpirvAttribute, IR::NumRenderTargets> frag_outputs{};
--
--    Id uf11_to_f32{};
--    Id f32_to_uf11{};
--    Id uf10_to_f32{};
--    Id f32_to_uf10{};
--
--    Id get_bda_pointer{};
--
--    Id read_const{};
--    Id read_const_dynamic{};
--
--private:
--    void DefineArithmeticTypes();
--    void DefineInterfaces();
--    void DefineInputs();
--    void DefineVertexBlock();
--    void DefineOutputs();
--    void DefinePushDataBlock();
--    void DefineBuffers();
--    void DefineImagesAndSamplers();
--    void DefineSharedMemory();
--    void DefineFunctions();
--
--    SpirvAttribute GetAttributeInfo(AmdGpu::NumberFormat fmt, Id id, u32 num_components,
--                                    bool output, bool loaded = false, bool array = false);
--
--    BufferSpv DefineBuffer(bool is_storage, bool is_written, u32 elem_shift, BufferType buffer_type,
--                           Id data_type);
--
--    Id DefineFloat32ToUfloatM5(u32 mantissa_bits, std::string_view name);
--    Id DefineUfloatM5ToFloat32(u32 mantissa_bits, std::string_view name);
--
--    Id DefineGetBdaPointer();
--
--    Id DefineReadConst(bool dynamic);
--
--    Id GetBufferSize(u32 sharp_idx);
--};
--
--} // namespace Shader::Backend::SPIRV
-+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+
-+#pragma once
-+
-+#include <array>
-+#include <unordered_map>
-+#include <sirit/sirit.h>
-+
-+#include "shader_recompiler/backend/bindings.h"
-+#include "shader_recompiler/info.h"
-+#include "shader_recompiler/ir/value.h"
-+#include "shader_recompiler/profile.h"
-+
-+namespace Shader::Backend::SPIRV {
-+
-+using Sirit::Id;
-+
-+struct VectorIds {
-+    [[nodiscard]] Id& operator[](u32 index) {
-+        return ids[index - 1];
-+    }
-+
-+    [[nodiscard]] const Id& operator[](u32 index) const {
-+        return ids[index - 1];
-+    }
-+
-+    [[nodiscard]] Id& Get(u32 index) {
-+        return ids[index - 1];
-+    }
-+
-+    [[nodiscard]] const Id& Get(u32 index) const {
-+        return ids[index - 1];
-+    }
-+
-+    std::array<Id, 4> ids;
-+};
-+
-+class EmitContext final : public Sirit::Module {
-+public:
-+    explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info, Info& info,
-+                         Bindings& binding);
-+    ~EmitContext();
-+
-+    Id Def(const IR::Value& value);
-+
-+    void DefineBufferProperties();
-+    void DefineAmdPerVertexAttribs();
-+    void DefineWorkgroupIndex();
-+
-+    [[nodiscard]] Id DefineInput(Id type, std::optional<u32> location = std::nullopt,
-+                                 std::optional<spv::BuiltIn> builtin = std::nullopt) {
-+        const Id input_id{DefineVariable(type, builtin, spv::StorageClass::Input)};
-+        if (location) {
-+            Decorate(input_id, spv::Decoration::Location, *location);
-+        }
-+        return input_id;
-+    }
-+
-+    [[nodiscard]] Id DefineOutput(Id type, std::optional<u32> location = std::nullopt,
-+                                  std::optional<spv::BuiltIn> builtin = std::nullopt) {
-+        const Id output_id{DefineVariable(type, builtin, spv::StorageClass::Output)};
-+        if (location) {
-+            Decorate(output_id, spv::Decoration::Location, *location);
-+        }
-+        return output_id;
-+    }
-+
-+    [[nodiscard]] Id DefineUniformConst(Id type, u32 set, u32 binding, bool readonly = false) {
-+        const Id uniform_id{DefineVar(type, spv::StorageClass::UniformConstant)};
-+        Decorate(uniform_id, spv::Decoration::DescriptorSet, set);
-+        Decorate(uniform_id, spv::Decoration::Binding, binding);
-+        if (readonly) {
-+            Decorate(uniform_id, spv::Decoration::NonWritable);
-+        }
-+        return uniform_id;
-+    }
-+
-+    template <bool global = true>
-+    [[nodiscard]] Id DefineVar(Id type, spv::StorageClass storage_class,
-+                               std::optional<Id> initializer = std::nullopt) {
-+        const Id pointer_type_id{TypePointer(storage_class, type)};
-+        return global ? AddGlobalVariable(pointer_type_id, storage_class, initializer)
-+                      : AddLocalVariable(pointer_type_id, storage_class, initializer);
-+    }
-+
-+    [[nodiscard]] Id DefineVariable(Id type, std::optional<spv::BuiltIn> builtin,
-+                                    spv::StorageClass storage_class,
-+                                    std::optional<Id> initializer = std::nullopt) {
-+        const Id id{DefineVar(type, storage_class, initializer)};
-+        if (builtin) {
-+            Decorate(id, spv::Decoration::BuiltIn, *builtin);
-+        }
-+        interfaces.push_back(id);
-+        return id;
-+    }
-+
-+    [[nodiscard]] Id ConstU32(u32 value) {
-+        return Constant(U32[1], value);
-+    }
-+
-+    template <typename... Args>
-+    [[nodiscard]] Id ConstU32(Args&&... values) {
-+        constexpr u32 size = static_cast<u32>(sizeof...(values));
-+        static_assert(size >= 2);
-+        const std::array constituents{Constant(U32[1], values)...};
-+        const Id type = size <= 4 ? U32[size] : TypeArray(U32[1], ConstU32(size));
-+        return ConstantComposite(type, constituents);
-+    }
-+
-+    [[nodiscard]] Id ConstS32(s32 value) {
-+        return Constant(S32[1], value);
-+    }
-+
-+    template <typename... Args>
-+    [[nodiscard]] Id ConstS32(Args&&... values) {
-+        constexpr u32 size = static_cast<u32>(sizeof...(values));
-+        static_assert(size >= 2);
-+        const std::array constituents{Constant(S32[1], values)...};
-+        const Id type = size <= 4 ? S32[size] : TypeArray(S32[1], ConstU32(size));
-+        return ConstantComposite(type, constituents);
-+    }
-+
-+    [[nodiscard]] Id ConstF32(f32 value) {
-+        return Constant(F32[1], value);
-+    }
-+
-+    template <typename... Args>
-+    [[nodiscard]] Id ConstF32(Args... values) {
-+        constexpr u32 size = static_cast<u32>(sizeof...(values));
-+        static_assert(size >= 2);
-+        const std::array constituents{Constant(F32[1], values)...};
-+        const Id type = size <= 4 ? F32[size] : TypeArray(F32[1], ConstU32(size));
-+        return ConstantComposite(type, constituents);
-+    }
-+
-+    inline Id AddLabel() {
-+        last_label = Module::AddLabel();
-+        return last_label;
-+    }
-+
-+    inline Id AddLabel(Id label) {
-+        last_label = Module::AddLabel(label);
-+        return last_label;
-+    }
-+
-+    Id EmitDwordMemoryRead(Id address, auto&& fallback) {
-+        const Id available_label = OpLabel();
-+        const Id fallback_label = OpLabel();
-+        const Id merge_label = OpLabel();
-+
-+        const Id addr = OpFunctionCall(U64, get_bda_pointer, address);
-+        const Id is_available = OpINotEqual(U1[1], addr, u64_zero_value);
-+        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
-+        OpBranchConditional(is_available, available_label, fallback_label);
-+
-+        // Available
-+        AddLabel(available_label);
-+        const Id addr_ptr = OpConvertUToPtr(physical_pointer_type_u32, addr);
-+        const Id result = OpLoad(U32[1], addr_ptr, spv::MemoryAccessMask::Aligned, 4u);
-+        OpBranch(merge_label);
-+
-+        // Fallback
-+        AddLabel(fallback_label);
-+        const Id fallback_result = fallback();
-+        OpBranch(merge_label);
-+
-+        // Merge
-+        AddLabel(merge_label);
-+        const Id final_result =
-+            OpPhi(U32[1], fallback_result, fallback_label, result, available_label);
-+        return final_result;
-+    }
-+
-+    Id EmitSharedMemoryAccess(const Id result_type, const Id shared_mem, const Id index) {
-+        if (std::popcount(static_cast<u32>(info.shared_types)) > 1) {
-+            return OpAccessChain(result_type, shared_mem, u32_zero_value, index);
-+        }
-+        // Workgroup layout struct omitted.
-+        return OpAccessChain(result_type, shared_mem, index);
-+    }
-+
-+    Id EmitFlatbufferLoad(Id flatbuf_offset) {
-+        const auto& flatbuf_buffer{buffers[flatbuf_index]};
-+        ASSERT(flatbuf_buffer.binding >= 0 && flatbuf_buffer.buffer_type == BufferType::Flatbuf);
-+        const auto [flatbuf_buffer_id, flatbuf_pointer_type] =
-+            flatbuf_buffer.aliases[u32(PointerType::U32)];
-+        const auto ptr{
-+            OpAccessChain(flatbuf_pointer_type, flatbuf_buffer_id, u32_zero_value, flatbuf_offset)};
-+        return OpLoad(U32[1], ptr);
-+    }
-+
-+    Info& info;
-+    const RuntimeInfo& runtime_info;
-+    const Profile& profile;
 +    HwStage hw_stage;
 +    SwStage sw_stage{};
 +
-+    Id last_label{};
-+
-+    Id void_id{};
-+    Id U8{};
-+    Id S8{};
-+    Id U16{};
-+    Id S16{};
-+    Id U64{};
-+    VectorIds F16{};
-+    VectorIds F32{};
-+    VectorIds F64{};
-+    VectorIds S32{};
-+    VectorIds U32{};
-+    VectorIds U1{};
-+
-+    Id full_result_i32x2;
-+    Id full_result_u32x2;
-+    Id frexp_result_f32;
-+    Id frexp_result_f64;
-+
-+    Id pi_x2;
-+
-+    Id true_value{};
-+    Id false_value{};
-+    Id u8_one_value{};
-+    Id u8_zero_value{};
-+    Id u16_zero_value{};
-+    Id u32_one_value{};
-+    Id u32_zero_value{};
++    // Counters for the Android-side shader workarounds (Turnip miscompiles the DSR skinned
++    // vertex shaders' reciprocal and contracts FMA across the NoContraction boundary).
++    // Kept as plain members so the emitter can report what it rewrote.
+     u32 fma_split_replaced{};
+     u32 fma_split_mul_emitted{};
+     u32 fma_split_add_emitted{};
+@@ -228,6 +232,7 @@ public:
+     Id u16_zero_value{};
+     Id u32_one_value{};
+     Id u32_zero_value{};
 +    Id f32_one_value{};
-+    Id f32_zero_value{};
-+    Id u64_one_value{};
-+    Id u64_zero_value{};
-+
-+    Id shared_u16{};
-+    Id shared_u32{};
-+    Id shared_u64{};
-+
-+    Id input_u32{};
-+    Id input_f32{};
-+    Id input_s32{};
-+    Id output_u32{};
-+    Id output_f32{};
-+    Id output_s32{};
-+
-+    Id gl_in{};
-+
-+    boost::container::small_vector<Id, 16> interfaces;
-+
-+    Id output_position{};
-+    Id output_point_size{};
-+    Id output_layer{};
-+    Id output_viewport_index{};
-+    Id primitive_id{};
-+    Id vertex_index{};
-+    Id instance_id{};
-+    Id push_data_block{};
-+    Id base_vertex{};
+     Id f32_zero_value{};
+     Id u64_one_value{};
+     Id u64_zero_value{};
+@@ -256,14 +261,19 @@ public:
+     Id instance_id{};
+     Id push_data_block{};
+     Id base_vertex{};
 +    Id base_instance{};
-+    Id frag_coord{};
-+    Id front_facing{};
-+    Id frag_depth{};
-+    Id stencil_ref{};
-+    Id sample_mask{};
+     Id frag_coord{};
+     Id front_facing{};
+     Id frag_depth{};
+     Id stencil_ref{};
+     Id sample_mask{};
 +    Id sample_mask_in{};
 +    Id helper_invocation{};
-+    Id sample_index{};
-+    Id clip_distances{};
-+    Id cull_distances{};
-+
-+    Id patch_vertices{};
-+    Id output_tess_level_outer{};
-+    Id output_tess_level_inner{};
-+    Id tess_coord;
-+    std::array<Id, 30> patches{};
-+
-+    Id workgroup_id{};
-+    Id num_workgroups_id{};
-+    Id workgroup_index_id{};
-+    Id local_invocation_id{};
+     Id sample_index{};
+     Id clip_distances{};
+     Id cull_distances{};
++    // How many clip/cull distances actually got an output slot. The guest can declare fewer
++    // than the host limit, and the emulated ones (MaxEmulatedClipDistances) are appended after.
+     u32 clip_distance_count{};
+     u32 cull_distance_count{};
+ 
+@@ -277,8 +287,10 @@ public:
+     Id num_workgroups_id{};
+     Id workgroup_index_id{};
+     Id local_invocation_id{};
 +    Id local_invocation_index{};
-+    Id invocation_id{};
-+    Id subgroup_local_invocation_id{};
+     Id invocation_id{};
+     Id subgroup_local_invocation_id{};
 +    Id subgroup_lt_mask{};
-+    Id image_u32{};
-+    Id image_f32{};
-+
-+    Id shared_memory_u16{};
-+    Id shared_memory_u32{};
-+    Id shared_memory_u64{};
-+
-+    Id shared_memory_u16_type{};
-+    Id shared_memory_u32_type{};
-+    Id shared_memory_u64_type{};
-+
+     Id image_u32{};
+     Id image_f32{};
+ 
+@@ -290,9 +302,11 @@ public:
+     Id shared_memory_u32_type{};
+     Id shared_memory_u64_type{};
+ 
 +    Id bary_coord{};
-+    Id bary_coord_smooth{};
-+    Id bary_coord_smooth_centroid{};
-+    Id bary_coord_smooth_sample{};
+     Id bary_coord_smooth{};
+     Id bary_coord_smooth_centroid{};
+     Id bary_coord_smooth_sample{};
 +    Id bary_coord_pull_model{};
-+    Id bary_coord_nopersp{};
-+    Id bary_coord_nopersp_sample{};
-+
-+    struct TextureDefinition {
-+        const VectorIds* data_types;
-+        Id id;
-+        Id sampled_type;
-+        Id image_type;
-+        AmdGpu::ImageType view_type;
-+        bool is_integer = false;
-+        bool is_storage = false;
-+        MipStorageFallbackMode mip_fallback_mode{};
-+    };
-+
-+    enum class PointerType : u32 {
-+        U8,
-+        U16,
-+        U32,
-+        F32,
-+        U64,
-+        F64,
-+        NumAlias,
-+    };
-+
-+    enum class PointerSize : u32 {
-+        B8,
-+        B16,
-+        B32,
-+        B64,
-+        NumClass,
-+    };
-+
-+    struct BufferSpv {
-+        Id id;
-+        Id pointer_type;
-+    };
-+
-+    struct BufferDefinition {
-+        u32 binding;
-+        BufferType buffer_type;
-+        std::array<Id, u32(PointerSize::NumClass)> offsets;
-+        std::array<BufferSpv, u32(PointerType::NumAlias)> aliases;
-+
-+        template <class Self>
-+        auto& Alias(this Self& self, PointerType alias) {
-+            return self.aliases[u32(alias)];
-+        }
-+
-+        template <class Self>
-+        auto& Offset(this Self& self, PointerSize size) {
-+            return self.offsets[u32(size)];
-+        }
-+    };
-+
-+    Bindings& binding;
-+    boost::container::small_vector<Id, 16> buf_type_ids;
-+    boost::container::small_vector<BufferDefinition, 16> buffers;
-+    boost::container::small_vector<TextureDefinition, 8> images;
-+    boost::container::small_vector<Id, 4> samplers;
-+    std::unordered_map<u32, Id> first_to_last_label_map;
-+
-+    size_t flatbuf_index{};
-+    size_t bda_pagetable_index{};
-+    size_t fault_buffer_index{};
-+    Id physical_pointer_type_u32;
-+
-+    Id sampler_type{};
-+    Id sampler_pointer_type{};
-+
-+    struct SpirvAttribute {
-+        union {
-+            Id id;
-+            std::array<Id, 3> id_array;
-+        };
-+        Id pointer_type;
-+        Id component_type;
-+        u32 num_components;
-+        bool is_integer{};
-+        bool is_loaded{};
-+        bool is_array{};
-+    };
-+    Id input_attr_array;
-+    Id output_attr_array;
-+    std::array<SpirvAttribute, IR::NumParams> input_params{};
-+    std::array<SpirvAttribute, IR::NumParams> output_params{};
-+    std::array<SpirvAttribute, IR::NumRenderTargets> frag_outputs{};
-+
-+    Id uf11_to_f32{};
-+    Id f32_to_uf11{};
-+    Id uf10_to_f32{};
-+    Id f32_to_uf10{};
-+
-+    Id get_bda_pointer{};
-+
-+    Id read_const{};
-+    Id read_const_dynamic{};
-+
-+private:
-+    void DefineArithmeticTypes();
-+    void DefineInterfaces();
-+    void DefineInputs();
-+    void DefineVertexBlock();
-+    void DefineOutputs();
-+    void DefinePushDataBlock();
-+    void DefineBuffers();
-+    void DefineImagesAndSamplers();
-+    void DefineSharedMemory();
-+    void DefineFunctions();
-+
-+    SpirvAttribute GetAttributeInfo(AmdGpu::NumberFormat fmt, Id id, u32 num_components,
-+                                    bool output, bool loaded = false, bool array = false);
-+
+     Id bary_coord_nopersp{};
+     Id bary_coord_nopersp_sample{};
+ 
+@@ -406,8 +420,8 @@ private:
+     SpirvAttribute GetAttributeInfo(AmdGpu::NumberFormat fmt, Id id, u32 num_components,
+                                     bool output, bool loaded = false, bool array = false);
+ 
+-    BufferSpv DefineBuffer(bool is_storage, bool is_written, u32 elem_shift, BufferType buffer_type,
+-                           Id data_type);
 +    BufferSpv DefineBuffer(bool is_written, bool is_coherent, u32 elem_shift,
 +                           BufferType buffer_type, Id data_type);
-+
-+    Id DefineFloat32ToUfloatM5(u32 mantissa_bits, std::string_view name);
-+    Id DefineUfloatM5ToFloat32(u32 mantissa_bits, std::string_view name);
-+
-+    Id DefineGetBdaPointer();
-+
-+    Id DefineReadConst(bool dynamic);
-+
-+    Id GetBufferSize(u32 sharp_idx);
-+};
-+
-+} // namespace Shader::Backend::SPIRV
+ 
+     Id DefineFloat32ToUfloatM5(u32 mantissa_bits, std::string_view name);
+     Id DefineUfloatM5ToFloat32(u32 mantissa_bits, std::string_view name);
 diff --git a/src/shader_recompiler/frontend/control_flow_graph.cpp b/src/shader_recompiler/frontend/control_flow_graph.cpp
 index fe082cb8..4f388cb1 100644
 --- a/src/shader_recompiler/frontend/control_flow_graph.cpp
@@ -373018,809 +371536,67 @@ index 00000000..17be2c0c
 +
 +} // namespace Shader::Optimization
 diff --git a/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp b/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
-index 9b2b50f8..bddfc3f4 100644
+index 9b2b50f8..2a5501b2 100644
 --- a/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
 +++ b/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
-@@ -1,661 +1,1215 @@
--// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
--// SPDX-License-Identifier: GPL-2.0-or-later
--
--#include <array>
--#include <atomic>
--#include <cerrno>
--#include <cstring>
--#include <memory>
--#include <mutex>
--#include <unordered_map>
--#include <vector>
--#include <boost/container/flat_map.hpp>
--#include <xbyak/xbyak.h>
--#include <xbyak/xbyak_util.h>
--#include "common/arch.h"
--#include "common/decoder.h"
--#include "common/io_file.h"
--#include "common/logging/log.h"
--#include "common/path_util.h"
--#include "common/signal_context.h"
--#include "core/emulator_settings.h"
--#include "core/signals.h"
--#include "shader_recompiler/info.h"
--#include "shader_recompiler/ir/breadth_first_search.h"
--#include "shader_recompiler/ir/opcodes.h"
--#include "shader_recompiler/ir/passes/srt.h"
--#include "shader_recompiler/ir/program.h"
--#include "shader_recompiler/ir/reg.h"
--#include "shader_recompiler/ir/srt_gvn_table.h"
--#include "shader_recompiler/ir/value.h"
--
--#if defined(ARCH_ARM64) && defined(__linux__)
--#include <sys/mman.h>
--#include <sys/ucontext.h>
--#include <unistd.h>
--#endif
--
--#ifdef ARCH_X86_64
--
--using namespace Xbyak::util;
--
--static Xbyak::CodeGenerator g_srt_codegen(32_MB);
--static const u8* g_srt_codegen_start = nullptr;
--
--namespace Shader {
--
--PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
--    const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
--    g_srt_codegen.db(ptr, size);
--    g_srt_codegen.ready();
--    return func_addr;
--}
--
--} // namespace Shader
--
--namespace {
--
--static void DumpSrtProgram(const Shader::Info& info, const u8* code, size_t codesize) {
--    using namespace Common::FS;
--
--    const auto dump_dir = GetUserPath(PathType::ShaderDir) / "dumps";
--    if (!std::filesystem::exists(dump_dir)) {
--        std::filesystem::create_directories(dump_dir);
--    }
--    const auto filename = fmt::format("{}_{:#018x}.srtprogram.txt", info.stage, info.pgm_hash);
--    const auto file = IOFile{dump_dir / filename, FileAccessMode::Create, FileType::TextFile};
--
--    u64 address = reinterpret_cast<u64>(code);
--    u64 code_end = address + codesize;
--    ZydisDecodedInstruction instruction;
--    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
--    ZyanStatus status = ZYAN_STATUS_SUCCESS;
--    while (address < code_end && ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(
--                                     instruction, operands, reinterpret_cast<void*>(address)))) {
--        std::string s =
--            Common::Decoder::Instance()->disassembleInst(instruction, operands, address);
--        s += "\n";
--        file.WriteString(s);
--        address += instruction.length;
--    }
--}
--
--static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
--    // Only handle if the fault address is within the SRT code range
--    const u8* code_start = g_srt_codegen_start;
--    const u8* code_end = code_start + g_srt_codegen.getSize();
--    const void* code = Common::GetRip(context);
--    if (code < code_start || code >= code_end) {
--        return false; // Not in SRT code range
--    }
--
--    // Patch instruction to zero register
--    ZydisDecodedInstruction instruction;
--    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
--    ZyanStatus status = Common::Decoder::Instance()->decodeInstruction(instruction, operands,
--                                                                       const_cast<void*>(code), 15);
--
--    ASSERT(ZYAN_SUCCESS(status) && instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
--           operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
--           operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
--
--    size_t len = instruction.length;
--    const size_t patch_size = 3;
--    u8* code_patch = const_cast<u8*>(reinterpret_cast<const u8*>(code));
--
--    // We can only encounter rdi or r10d as the first operand in a
--    // fault memory access for SRT walker.
--    switch (operands[0].reg.value) {
--    case ZYDIS_REGISTER_RDI:
--        // mov rdi, [rdi + (off_dw << 2)] -> xor rdi, rdi
--        code_patch[0] = 0x48;
--        code_patch[1] = 0x31;
--        code_patch[2] = 0xFF;
--        break;
--    case ZYDIS_REGISTER_R10D:
--        // mov r10d, [rdi + (off_dw << 2)] -> xor r10d, r10d
--        code_patch[0] = 0x45;
--        code_patch[1] = 0x31;
--        code_patch[2] = 0xD2;
--        break;
--    default:
--        UNREACHABLE_MSG("Unsupported register for SRT walker patch");
--        return false;
--    }
--
--    // Fill nops
--    memset(code_patch + patch_size, 0x90, len - patch_size);
--
--    LOG_DEBUG(Render_Recompiler, "Patched SRT walker at {}", code);
--
--    return true;
--}
--
--using namespace Shader;
--
--struct PassInfo {
--    // map offset to inst
--    using PtrUserList = boost::container::flat_map<u32, Shader::IR::Inst*>;
--
--    Optimization::SrtGvnTable gvn_table;
--    // keys are GetUserData or ReadConst instructions that are used as pointers
--    std::unordered_map<IR::Inst*, PtrUserList> pointer_uses;
--    // GetUserData instructions corresponding to sgpr_base of SRT roots
--    boost::container::small_flat_map<IR::ScalarReg, IR::Inst*, 1> srt_roots;
--
--    // pick a single inst for a given value number
--    std::unordered_map<u32, IR::Inst*> vn_to_inst;
--
--    // Bumped during codegen to assign offsets to readconsts
--    u32 dst_off_dw;
--
--    PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
--        auto it = pointer_uses.find(inst);
--        if (it != pointer_uses.end()) {
--            return &it->second;
--        }
--        return nullptr;
--    }
--
--    // Return a single instruction that this instruction is identical to, according
--    // to value number
--    // The "original" is arbitrary. Here it's the first instruction found for a given value number
--    IR::Inst* DeduplicateInstruction(IR::Inst* inst) {
--        auto it = vn_to_inst.try_emplace(gvn_table.GetValueNumber(inst), inst);
--        return it.first->second;
--    }
--};
--} // namespace
--
--namespace Shader::Optimization {
--
--namespace {
--
--static inline void PushPtr(Xbyak::CodeGenerator& c, u32 off_dw) {
--    c.push(rdi);
--    c.mov(rdi, ptr[rdi + (off_dw << 2)]);
--    c.mov(r10, 0xFFFFFFFFFFFFULL);
--    c.and_(rdi, r10);
--}
--
--static inline void PopPtr(Xbyak::CodeGenerator& c) {
--    c.pop(rdi);
--};
--
--static void VisitPointer(u32 off_dw, IR::Inst* subtree, PassInfo& pass_info,
--                         Xbyak::CodeGenerator& c) {
--    PushPtr(c, off_dw);
--    PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
--    ASSERT(use_list);
--
--    // First copy all the src data from this tree level
--    // That way, all data that was contiguous in the guest SRT is also contiguous in the
--    // flattened buffer.
--    // TODO src and dst are contiguous. Optimize with wider loads/stores
--    // TODO if this subtree is dynamically indexed, don't compact it (keep it sparse)
--    for (auto [src_off_dw, use] : *use_list) {
--        c.mov(r10d, ptr[rdi + (src_off_dw << 2)]);
--        c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r10d);
--
--        use->SetFlags<u32>(pass_info.dst_off_dw);
--        pass_info.dst_off_dw++;
--    }
--
--    // Then visit any children used as pointers
--    for (const auto [src_off_dw, use] : *use_list) {
--        if (pass_info.GetUsesAsPointer(use)) {
--            VisitPointer(src_off_dw, use, pass_info, c);
--        }
--    }
--
--    PopPtr(c);
--}
--
--static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
--    Xbyak::CodeGenerator& c = g_srt_codegen;
--
--    if (pass_info.srt_roots.empty()) {
--        return;
--    }
--
--    // Register the signal handler for SRT walker, if not already registered
--    if (g_srt_codegen_start == nullptr) {
--        g_srt_codegen_start = c.getCurr();
--        auto* signals = Core::Signals::Instance();
--        // Call after the memory invalidation handler
--        constexpr u32 priority = 1;
--        signals->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
--    }
--
--    info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
--    pass_info.dst_off_dw = NUM_USER_DATA_REGS;
--    ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
--
--    for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
--        VisitPointer(static_cast<u32>(sgpr_base), root, pass_info, c);
--    }
--
--    c.ret();
--    c.ready();
--
--    info.srt_info.walker_func_size =
--        c.getCurr() - reinterpret_cast<const u8*>(info.srt_info.walker_func);
--
--    if (EmulatorSettings.IsDumpShaders()) {
--        DumpSrtProgram(info, reinterpret_cast<const u8*>(info.srt_info.walker_func),
--                       info.srt_info.walker_func_size);
--    }
--
--    info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
--}
--
--}; // namespace
--
--void FlattenExtendedUserdataPass(IR::Program& program) {
--    Shader::Info& info = program.info;
--    PassInfo pass_info;
--
--    // traverse at end and assign offsets to duplicate readconsts, using
--    // vn_to_inst as the source
--    boost::container::small_vector<IR::Inst*, 32> all_readconsts;
--
--    for (auto r_it = program.post_order_blocks.rbegin(); r_it != program.post_order_blocks.rend();
--         r_it++) {
--        IR::Block* block = *r_it;
--        for (IR::Inst& inst : *block) {
--            if (inst.GetOpcode() == IR::Opcode::ReadConst) {
--                if (!inst.Arg(1).IsImmediate()) {
--                    LOG_WARNING(Render_Recompiler, "ReadConst has non-immediate offset");
--                    continue;
--                }
--
--                all_readconsts.push_back(&inst);
--                if (pass_info.DeduplicateInstruction(&inst) != &inst) {
--                    // This is a duplicate of a readconst we've already visited
--                    continue;
--                }
--
--                IR::Inst* ptr_composite = inst.Arg(0).InstRecursive();
--
--                const auto pred = [](IR::Inst* inst) -> std::optional<IR::Inst*> {
--                    if (inst->GetOpcode() == IR::Opcode::GetUserData ||
--                        inst->GetOpcode() == IR::Opcode::ReadConst) {
--                        return inst;
--                    }
--                    return std::nullopt;
--                };
--                auto base0 = IR::BreadthFirstSearch(ptr_composite->Arg(0), pred);
--                auto base1 = IR::BreadthFirstSearch(ptr_composite->Arg(1), pred);
--                ASSERT_MSG(base0 && base1, "ReadConst not from constant memory");
--
--                IR::Inst* ptr_lo = base0.value();
--                ptr_lo = pass_info.DeduplicateInstruction(ptr_lo);
--
--                auto ptr_uses_kv =
--                    pass_info.pointer_uses.try_emplace(ptr_lo, PassInfo::PtrUserList{});
--                PassInfo::PtrUserList& user_list = ptr_uses_kv.first->second;
--
--                user_list[inst.Arg(1).U32()] = &inst;
--
--                if (ptr_lo->GetOpcode() == IR::Opcode::GetUserData) {
--                    IR::ScalarReg ud_reg = ptr_lo->Arg(0).ScalarReg();
--                    pass_info.srt_roots[ud_reg] = ptr_lo;
--                }
--            }
--        }
--    }
--
--    GenerateSrtProgram(info, pass_info);
--
--    // Assign offsets to duplicate readconsts
--    for (IR::Inst* readconst : all_readconsts) {
--        ASSERT(pass_info.vn_to_inst.contains(pass_info.gvn_table.GetValueNumber(readconst)));
--        IR::Inst* original = pass_info.DeduplicateInstruction(readconst);
--        readconst->SetFlags<u32>(original->Flags<u32>());
--    }
--
--    info.RefreshFlatBuf();
--}
--
--} // namespace Shader::Optimization
--
--#elif defined(ARCH_ARM64) && defined(__linux__)
--
--namespace {
--
--constexpr u32 Arm64MovX2X0 = 0xaa0003e2;
--constexpr u32 Arm64PushX2 = 0xf81f0fe2;
--constexpr u32 Arm64PopX2 = 0xf84107e2;
--constexpr u32 Arm64LoadPointer = 0xf8646842;
--constexpr u32 Arm64MaskPointer = 0xd340bc42;
--constexpr u32 Arm64LoadDataRegisterOffset = 0xb8646843;
--constexpr u32 Arm64StoreDataRegisterOffset = 0xb8256823;
--constexpr u32 Arm64Ret = 0xd65f03c0;
--constexpr size_t MaxSrtCodeRanges = 32768;
--
--struct SrtCodeRange {
--    uintptr_t begin{};
--    uintptr_t end{};
--};
--
--struct SrtCodeMapping {
--    u8* data{};
--    size_t size{};
--
--    ~SrtCodeMapping() {
--        if (data != nullptr) {
--            munmap(data, size);
--        }
--    }
--};
--
--std::array<SrtCodeRange, MaxSrtCodeRanges> g_srt_code_ranges{};
--std::atomic_size_t g_srt_code_range_count{};
--std::mutex g_srt_code_mutex;
--std::vector<std::unique_ptr<SrtCodeMapping>> g_srt_code_mappings;
--std::once_flag g_srt_signal_once;
--
--bool IsSrtCodeAddress(uintptr_t pc) {
--    const size_t count = g_srt_code_range_count.load(std::memory_order_acquire);
--    for (size_t index = 0; index < count; ++index) {
--        const auto& range = g_srt_code_ranges[index];
--        if (pc >= range.begin && pc < range.end) {
--            return true;
--        }
--    }
--    return false;
--}
--
--bool SrtWalkerSignalHandler(void* context, void* fault_address) {
--    const auto pc = reinterpret_cast<uintptr_t>(Common::GetRip(context));
--    if (!IsSrtCodeAddress(pc)) {
--        return false;
--    }
--
--    u32 instruction{};
--    std::memcpy(&instruction, reinterpret_cast<const void*>(pc), sizeof(instruction));
--    auto* signal_context = static_cast<ucontext_t*>(context);
--    if (instruction == Arm64LoadPointer) {
--        signal_context->uc_mcontext.regs[2] = 0;
--    } else if ((instruction & 0xffc003ffu) == 0xb9400043u ||
--               instruction == Arm64LoadDataRegisterOffset) {
--        signal_context->uc_mcontext.regs[3] = 0;
--    } else {
--        return false;
--    }
--    Common::IncrementRip(context, sizeof(u32));
--    return true;
--}
--
--bool IsArm64SrtWalker(const u8* ptr, size_t size) {
--    if (ptr == nullptr || size < sizeof(u32) * 2 || size % sizeof(u32) != 0) {
--        return false;
--    }
--    u32 first{};
--    u32 last{};
--    std::memcpy(&first, ptr, sizeof(first));
--    std::memcpy(&last, ptr + size - sizeof(last), sizeof(last));
--    return first == Arm64MovX2X0 && last == Arm64Ret;
--}
--
--class Arm64SrtEmitter {
--public:
--    void Begin() {
--        Emit(Arm64MovX2X0);
--    }
--
--    void PushPointer(u32 offset_dw) {
--        Emit(Arm64PushX2);
--        MoveImmediate(4, static_cast<u64>(offset_dw) * sizeof(u32));
--        Emit(Arm64LoadPointer);
--        Emit(Arm64MaskPointer);
--    }
--
--    void PopPointer() {
--        Emit(Arm64PopX2);
--    }
--
--    void CopyDword(u32 source_offset_dw, u32 destination_offset_dw) {
--        if (source_offset_dw <= 0xfff) {
--            Emit(0xb9400043u | (source_offset_dw << 10));
--        } else {
--            MoveImmediate(4, static_cast<u64>(source_offset_dw) * sizeof(u32));
--            Emit(Arm64LoadDataRegisterOffset);
--        }
--
--        if (destination_offset_dw <= 0xfff) {
--            Emit(0xb9000023u | (destination_offset_dw << 10));
--        } else {
--            MoveImmediate(5, static_cast<u64>(destination_offset_dw) * sizeof(u32));
--            Emit(Arm64StoreDataRegisterOffset);
--        }
--    }
--
--    void End() {
--        Emit(Arm64Ret);
--    }
--
--    const u8* Data() const {
--        return reinterpret_cast<const u8*>(code.data());
--    }
--
--    size_t Size() const {
--        return code.size() * sizeof(u32);
--    }
--
--private:
--    void Emit(u32 instruction) {
--        code.push_back(instruction);
--    }
--
--    void MoveImmediate(u32 reg, u64 value) {
--        Emit(0xd2800000u | reg | (static_cast<u32>(value & 0xffff) << 5));
--        for (u32 halfword = 1; halfword < 4; ++halfword) {
--            const u32 part = static_cast<u32>((value >> (halfword * 16)) & 0xffff);
--            if (part != 0) {
--                Emit(0xf2800000u | reg | (halfword << 21) | (part << 5));
--            }
--        }
--    }
--
--    std::vector<u32> code;
--};
--
--using namespace Shader;
--
--struct PassInfo {
--    using PtrUserList = boost::container::flat_map<u32, Shader::IR::Inst*>;
--
--    Optimization::SrtGvnTable gvn_table;
--    std::unordered_map<IR::Inst*, PtrUserList> pointer_uses;
--    boost::container::small_flat_map<IR::ScalarReg, IR::Inst*, 1> srt_roots;
--    std::unordered_map<u32, IR::Inst*> vn_to_inst;
--    u32 dst_off_dw;
--
--    PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
--        auto it = pointer_uses.find(inst);
--        return it != pointer_uses.end() ? &it->second : nullptr;
--    }
--
--    IR::Inst* DeduplicateInstruction(IR::Inst* inst) {
--        auto it = vn_to_inst.try_emplace(gvn_table.GetValueNumber(inst), inst);
--        return it.first->second;
--    }
--};
--
--} // namespace
--
--namespace Shader {
--
--PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
--    if (!IsArm64SrtWalker(ptr, size)) {
--        LOG_WARNING(Render_Recompiler,
--                    "Ignoring incompatible cached SRT walker; shader will be recompiled");
--        return nullptr;
--    }
--
--    std::lock_guard lock{g_srt_code_mutex};
--    const size_t range_index = g_srt_code_range_count.load(std::memory_order_relaxed);
--    if (range_index >= g_srt_code_ranges.size()) {
--        LOG_CRITICAL(Render_Recompiler, "ARM64 SRT walker range table is full");
--        std::abort();
--    }
--
--    const long page_size_result = sysconf(_SC_PAGESIZE);
--    if (page_size_result <= 0) {
--        LOG_CRITICAL(Render_Recompiler, "Unable to query host page size for ARM64 SRT walker");
--        std::abort();
--    }
--    const size_t page_size = static_cast<size_t>(page_size_result);
--    const size_t mapping_size = (size + page_size - 1) & ~(page_size - 1);
--    auto mapping = std::make_unique<SrtCodeMapping>();
--    mapping->data = static_cast<u8*>(
--        mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
--    mapping->size = mapping_size;
--    if (mapping->data == MAP_FAILED) {
--        mapping->data = nullptr;
--        LOG_CRITICAL(Render_Recompiler, "Unable to allocate ARM64 SRT walker: errno {}", errno);
--        std::abort();
--    }
--    std::memcpy(mapping->data, ptr, size);
--    __builtin___clear_cache(reinterpret_cast<char*>(mapping->data),
--                            reinterpret_cast<char*>(mapping->data + size));
--    if (mprotect(mapping->data, mapping_size, PROT_READ | PROT_EXEC) != 0) {
--        LOG_CRITICAL(Render_Recompiler, "Unable to protect ARM64 SRT walker: errno {}", errno);
--        std::abort();
--    }
--
--    std::call_once(g_srt_signal_once, [] {
--        constexpr u32 priority = 1;
--        Core::Signals::Instance()->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
--    });
--
--    const auto begin = reinterpret_cast<uintptr_t>(mapping->data);
--    auto* function = reinterpret_cast<PFN_SrtWalker>(mapping->data);
--    g_srt_code_mappings.push_back(std::move(mapping));
--    g_srt_code_ranges[range_index] = {begin, begin + size};
--    g_srt_code_range_count.store(range_index + 1, std::memory_order_release);
--    return function;
--}
--
--} // namespace Shader
--
--namespace Shader::Optimization {
--
--namespace {
--
--void VisitPointer(u32 offset_dw, IR::Inst* subtree, PassInfo& pass_info,
--                  Arm64SrtEmitter& emitter) {
--    emitter.PushPointer(offset_dw);
--    PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
--    ASSERT(use_list);
--
--    for (auto [source_offset_dw, use] : *use_list) {
--        emitter.CopyDword(source_offset_dw, pass_info.dst_off_dw);
--        use->SetFlags<u32>(pass_info.dst_off_dw++);
--    }
--
--    for (const auto [source_offset_dw, use] : *use_list) {
--        if (pass_info.GetUsesAsPointer(use)) {
--            VisitPointer(source_offset_dw, use, pass_info, emitter);
--        }
--    }
--    emitter.PopPointer();
--}
--
--void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
--    if (pass_info.srt_roots.empty()) {
--        return;
--    }
--
--    Arm64SrtEmitter emitter;
--    emitter.Begin();
--    pass_info.dst_off_dw = NUM_USER_DATA_REGS;
--    ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
--    for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
--        VisitPointer(static_cast<u32>(sgpr_base), root, pass_info, emitter);
--    }
--    emitter.End();
--
--    info.srt_info.walker_func = RegisterWalkerCode(emitter.Data(), emitter.Size());
--    ASSERT(info.srt_info.walker_func != nullptr);
--    info.srt_info.walker_func_size = emitter.Size();
--    info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
--}
--
--} // namespace
--
--void FlattenExtendedUserdataPass(IR::Program& program) {
--    Shader::Info& info = program.info;
--    PassInfo pass_info;
--    boost::container::small_vector<IR::Inst*, 32> all_readconsts;
--
--    for (auto r_it = program.post_order_blocks.rbegin(); r_it != program.post_order_blocks.rend();
--         ++r_it) {
--        IR::Block* block = *r_it;
--        for (IR::Inst& inst : *block) {
--            if (inst.GetOpcode() != IR::Opcode::ReadConst) {
--                continue;
--            }
--            if (!inst.Arg(1).IsImmediate()) {
--                LOG_WARNING(Render_Recompiler, "ReadConst has non-immediate offset");
--                continue;
--            }
--
--            all_readconsts.push_back(&inst);
--            if (pass_info.DeduplicateInstruction(&inst) != &inst) {
--                continue;
--            }
--
--            IR::Inst* ptr_composite = inst.Arg(0).InstRecursive();
--            const auto pred = [](IR::Inst* candidate) -> std::optional<IR::Inst*> {
--                if (candidate->GetOpcode() == IR::Opcode::GetUserData ||
--                    candidate->GetOpcode() == IR::Opcode::ReadConst) {
--                    return candidate;
--                }
--                return std::nullopt;
--            };
--            auto base0 = IR::BreadthFirstSearch(ptr_composite->Arg(0), pred);
--            auto base1 = IR::BreadthFirstSearch(ptr_composite->Arg(1), pred);
--            ASSERT_MSG(base0 && base1, "ReadConst not from constant memory");
--
--            IR::Inst* ptr_lo = pass_info.DeduplicateInstruction(base0.value());
--            auto [uses, inserted] =
--                pass_info.pointer_uses.try_emplace(ptr_lo, PassInfo::PtrUserList{});
--            uses->second[inst.Arg(1).U32()] = &inst;
--            if (ptr_lo->GetOpcode() == IR::Opcode::GetUserData) {
--                pass_info.srt_roots[ptr_lo->Arg(0).ScalarReg()] = ptr_lo;
--            }
--        }
--    }
--
--    GenerateSrtProgram(info, pass_info);
--    for (IR::Inst* readconst : all_readconsts) {
--        ASSERT(pass_info.vn_to_inst.contains(pass_info.gvn_table.GetValueNumber(readconst)));
--        IR::Inst* original = pass_info.DeduplicateInstruction(readconst);
--        readconst->SetFlags<u32>(original->Flags<u32>());
--    }
--    info.RefreshFlatBuf();
--}
--
--} // namespace Shader::Optimization
--
--#else
--
--namespace Shader {
--
--PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
--    UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");
--}
--
--namespace Optimization {
--
--void FlattenExtendedUserdataPass(IR::Program& program) {
--    UNREACHABLE_MSG("FlattenExtendedUserdataPass unimplemented for target architecture.");
--}
--
--} // namespace Optimization
--
--} // namespace Shader
--
--#endif
-+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+
-+#include <array>
-+#include <atomic>
-+#include <cerrno>
-+#include <cstring>
-+#include <memory>
-+#include <mutex>
-+#include <unordered_map>
-+#include <vector>
-+#include <boost/container/flat_map.hpp>
+@@ -10,6 +10,7 @@
+ #include <unordered_map>
+ #include <vector>
+ #include <boost/container/flat_map.hpp>
 +#include <queue>
-+#include <xbyak/xbyak.h>
-+#include <xbyak/xbyak_util.h>
-+#include "common/arch.h"
-+#include "common/decoder.h"
-+#include "common/io_file.h"
-+#include "common/logging/log.h"
-+#include "common/path_util.h"
-+#include "common/signal_context.h"
-+#include "core/emulator_settings.h"
-+#include "core/signals.h"
-+#include "shader_recompiler/info.h"
+ #include <xbyak/xbyak.h>
+ #include <xbyak/xbyak_util.h>
+ #include "common/arch.h"
+@@ -22,6 +23,7 @@
+ #include "core/signals.h"
+ #include "shader_recompiler/info.h"
+ #include "shader_recompiler/ir/breadth_first_search.h"
 +#include "shader_recompiler/ir/ir_emitter.h"
-+#include "shader_recompiler/ir/opcodes.h"
-+#include "shader_recompiler/ir/passes/srt.h"
-+#include "shader_recompiler/ir/program.h"
-+#include "shader_recompiler/ir/reg.h"
-+#include "shader_recompiler/ir/srt_gvn_table.h"
-+#include "shader_recompiler/ir/value.h"
-+
-+#if defined(ARCH_ARM64) && defined(__linux__)
-+#include <sys/mman.h>
-+#include <sys/ucontext.h>
-+#include <unistd.h>
-+#endif
-+
-+#ifdef ARCH_X86_64
-+
-+using namespace Xbyak::util;
-+
-+static Xbyak::CodeGenerator g_srt_codegen(32_MB);
-+static const u8* g_srt_codegen_start = nullptr;
-+
-+namespace Shader {
-+
-+PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
-+    const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
-+    g_srt_codegen.db(ptr, size);
-+    g_srt_codegen.ready();
-+    return func_addr;
-+}
-+
-+} // namespace Shader
-+
+ #include "shader_recompiler/ir/opcodes.h"
+ #include "shader_recompiler/ir/passes/srt.h"
+ #include "shader_recompiler/ir/program.h"
+@@ -35,6 +37,18 @@
+ #include <unistd.h>
+ #endif
+ 
 +namespace {
 +
-+static void DumpSrtProgram(const Shader::Info& info, const u8* code, size_t codesize) {
-+    using namespace Common::FS;
-+
-+    const auto dump_dir = GetUserPath(PathType::ShaderDir) / "dumps";
-+    if (!std::filesystem::exists(dump_dir)) {
-+        std::filesystem::create_directories(dump_dir);
-+    }
-+    const auto filename = fmt::format("{}_{:#018x}.srtprogram.txt", info.hw_stage, info.pgm_hash);
-+    const auto file = IOFile{dump_dir / filename, FileAccessMode::Create, FileType::TextFile};
-+
-+    u64 address = reinterpret_cast<u64>(code);
-+    u64 code_end = address + codesize;
-+    ZydisDecodedInstruction instruction;
-+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-+    ZyanStatus status = ZYAN_STATUS_SUCCESS;
-+    while (address < code_end && ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(
-+                                     instruction, operands, reinterpret_cast<void*>(address)))) {
-+        std::string s =
-+            Common::Decoder::Instance()->disassembleInst(instruction, operands, address);
-+        s += "\n";
-+        file.WriteString(s);
-+        address += instruction.length;
-+    }
++// 0.21.1 dropped IR::Value::InstRecursive() together with the Identity opcode it used to walk,
++// so there is no longer an identity chain to skip and Inst() is the whole conversion. Kept as a
++// named helper because both the x86 and the aarch64 SRT walker call it and the intent should
++// survive the next upstream reshuffle.
++IR::Inst* InstRecursive(IR::Value value) {
++    return value.TryInst();
 +}
 +
-+static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
-+    // Only handle if the fault address is within the SRT code range
-+    const u8* code_start = g_srt_codegen_start;
-+    const u8* code_end = code_start + g_srt_codegen.getSize();
-+    const void* code = Common::GetRip(context);
-+    if (code < code_start || code >= code_end) {
-+        return false; // Not in SRT code range
-+    }
++} // namespace
 +
-+    // Patch instruction to zero register
-+    ZydisDecodedInstruction instruction;
-+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-+    ZyanStatus status = Common::Decoder::Instance()->decodeInstruction(instruction, operands,
-+                                                                       const_cast<void*>(code), 15);
-+
-+    ASSERT(ZYAN_SUCCESS(status) && instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
-+           operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-+           operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
-+
-+    size_t len = instruction.length;
-+    const size_t patch_size = 3;
-+    u8* code_patch = const_cast<u8*>(reinterpret_cast<const u8*>(code));
-+
-+    // We can only encounter rdi or r10d as the first operand in a
-+    // fault memory access for SRT walker.
-+    switch (operands[0].reg.value) {
-+    case ZYDIS_REGISTER_RDI:
-+        // mov rdi, [rdi + (off_dw << 2)] -> xor rdi, rdi
-+        code_patch[0] = 0x48;
-+        code_patch[1] = 0x31;
-+        code_patch[2] = 0xFF;
-+        break;
-+    case ZYDIS_REGISTER_R10D:
-+        // mov r10d, [rdi + (off_dw << 2)] -> xor r10d, r10d
-+        code_patch[0] = 0x45;
-+        code_patch[1] = 0x31;
-+        code_patch[2] = 0xD2;
-+        break;
-+    default:
-+        UNREACHABLE_MSG("Unsupported register for SRT walker patch");
-+        return false;
-+    }
-+
-+    // Fill nops
-+    memset(code_patch + patch_size, 0x90, len - patch_size);
-+
+ #ifdef ARCH_X86_64
+ 
+ using namespace Xbyak::util;
+@@ -62,7 +76,7 @@ static void DumpSrtProgram(const Shader::Info& info, const u8* code, size_t code
+     if (!std::filesystem::exists(dump_dir)) {
+         std::filesystem::create_directories(dump_dir);
+     }
+-    const auto filename = fmt::format("{}_{:#018x}.srtprogram.txt", info.stage, info.pgm_hash);
++    const auto filename = fmt::format("{}_{:#018x}.srtprogram.txt", info.hw_stage, info.pgm_hash);
+     const auto file = IOFile{dump_dir / filename, FileAccessMode::Create, FileType::TextFile};
+ 
+     u64 address = reinterpret_cast<u64>(code);
+@@ -126,7 +140,8 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
+     // Fill nops
+     memset(code_patch + patch_size, 0x90, len - patch_size);
+ 
+-    LOG_DEBUG(Render_Recompiler, "Patched SRT walker at {}", code);
 +    LOG_WARNING(Render_Recompiler, "Patched SRT walker at {}, fault address {}", code,
 +                fault_address);
-+
-+    return true;
-+}
-+
-+using namespace Shader;
-+
-+struct PassInfo {
+ 
+     return true;
+ }
+@@ -134,11 +149,43 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
+ using namespace Shader;
+ 
+ struct PassInfo {
 +    struct PointerListCompare {
 +        bool operator()(const IR::Value& a, const IR::Value& b) const {
 +            // Keep order with the following criteria:
@@ -373852,44 +371628,31 @@ index 9b2b50f8..bddfc3f4 100644
 +        }
 +    };
 +
-+    // map offset to inst
+     // map offset to inst
+-    using PtrUserList = boost::container::flat_map<u32, Shader::IR::Inst*>;
 +    using PtrUserList =
 +        boost::container::flat_map<IR::Value, Shader::IR::Inst*, PointerListCompare>;
-+
-+    Optimization::SrtGvnTable gvn_table;
+ 
+     Optimization::SrtGvnTable gvn_table;
+-    // keys are GetUserData or ReadConst instructions that are used as pointers
 +    // keys are GetUserData, ReadConst or ReadConstBuffer instructions that are used as pointers
-+    std::unordered_map<IR::Inst*, PtrUserList> pointer_uses;
-+    // GetUserData instructions corresponding to sgpr_base of SRT roots
-+    boost::container::small_flat_map<IR::ScalarReg, IR::Inst*, 1> srt_roots;
-+
-+    // pick a single inst for a given value number
-+    std::unordered_map<u32, IR::Inst*> vn_to_inst;
-+
-+    // Bumped during codegen to assign offsets to readconsts
+     std::unordered_map<IR::Inst*, PtrUserList> pointer_uses;
+     // GetUserData instructions corresponding to sgpr_base of SRT roots
+     boost::container::small_flat_map<IR::ScalarReg, IR::Inst*, 1> srt_roots;
+@@ -147,7 +194,7 @@ struct PassInfo {
+     std::unordered_map<u32, IR::Inst*> vn_to_inst;
+ 
+     // Bumped during codegen to assign offsets to readconsts
+-    u32 dst_off_dw;
 +    u16 dst_off_dw;
-+
-+    PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
-+        auto it = pointer_uses.find(inst);
-+        if (it != pointer_uses.end()) {
-+            return &it->second;
-+        }
-+        return nullptr;
-+    }
-+
-+    // Return a single instruction that this instruction is identical to, according
-+    // to value number
-+    // The "original" is arbitrary. Here it's the first instruction found for a given value number
-+    IR::Inst* DeduplicateInstruction(IR::Inst* inst) {
-+        auto it = vn_to_inst.try_emplace(gvn_table.GetValueNumber(inst), inst);
-+        return it.first->second;
-+    }
-+};
-+} // namespace
-+
-+namespace Shader::Optimization {
-+
-+namespace {
-+
+ 
+     PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
+         auto it = pointer_uses.find(inst);
+@@ -171,20 +218,411 @@ namespace Shader::Optimization {
+ 
+ namespace {
+ 
+-static inline void PushPtr(Xbyak::CodeGenerator& c, u32 off_dw) {
 +static inline u16 GetFlatbufOffset(const IR::Inst* inst) {
 +    if (inst->GetOpcode() == IR::Opcode::ReadConstBuffer) {
 +        auto inst_info = inst->Flags<IR::BufferInstInfo>();
@@ -374265,7 +372028,8 @@ index 9b2b50f8..bddfc3f4 100644
 +}
 +
 +static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const IR::Value& off_dw) {
-+    c.push(rdi);
+     c.push(rdi);
+-    c.mov(rdi, ptr[rdi + (off_dw << 2)]);
 +    if (off_dw.IsImmediate()) {
 +        c.mov(rdi, ptr[rdi + (off_dw.U32() << 2)]);
 +    } else {
@@ -374274,17 +372038,20 @@ index 9b2b50f8..bddfc3f4 100644
 +        c.mov(r10d, r10d);
 +        c.mov(rdi, ptr[rdi + r10]);
 +    }
-+    c.mov(r10, 0xFFFFFFFFFFFFULL);
-+    c.and_(rdi, r10);
+     c.mov(r10, 0xFFFFFFFFFFFFULL);
+     c.and_(rdi, r10);
 +    return true;
+ }
+ 
+ static inline void PopPtr(Xbyak::CodeGenerator& c) {
+     c.pop(rdi);
+-};
 +}
-+
-+static inline void PopPtr(Xbyak::CodeGenerator& c) {
-+    c.pop(rdi);
-+}
-+
+ 
+-static void VisitPointer(u32 off_dw, IR::Inst* subtree, PassInfo& pass_info,
 +static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& pass_info,
-+                         Xbyak::CodeGenerator& c) {
+                          Xbyak::CodeGenerator& c) {
+-    PushPtr(c, off_dw);
 +    if (subtree->GetOpcode() == IR::Opcode::ReadConst && subtree->Flags<u16>() == 0 ||
 +        subtree->GetOpcode() == IR::Opcode::ReadConstBuffer &&
 +            subtree->Flags<IR::BufferInstInfo>().flatbuf_off_dw == 0) {
@@ -374295,15 +372062,14 @@ index 9b2b50f8..bddfc3f4 100644
 +        LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
 +        return;
 +    }
-+    PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
-+    ASSERT(use_list);
-+
-+    // First copy all the src data from this tree level
-+    // That way, all data that was contiguous in the guest SRT is also contiguous in the
-+    // flattened buffer.
-+    // TODO src and dst are contiguous. Optimize with wider loads/stores
-+    // TODO if this subtree is dynamically indexed, don't compact it (keep it sparse)
-+    for (auto [src_off_dw, use] : *use_list) {
+     PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
+     ASSERT(use_list);
+ 
+@@ -194,10 +632,20 @@ static void VisitPointer(u32 off_dw, IR::Inst* subtree, PassInfo& pass_info,
+     // TODO src and dst are contiguous. Optimize with wider loads/stores
+     // TODO if this subtree is dynamically indexed, don't compact it (keep it sparse)
+     for (auto [src_off_dw, use] : *use_list) {
+-        c.mov(r10d, ptr[rdi + (src_off_dw << 2)]);
 +        if (src_off_dw.IsImmediate()) {
 +            c.mov(r10d, ptr[rdi + (src_off_dw.U32() << 2)]);
 +        } else {
@@ -374315,60 +372081,27 @@ index 9b2b50f8..bddfc3f4 100644
 +            c.mov(r10d, r10d);
 +            c.mov(r10d, dword[rdi + r10]);
 +        }
-+        c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r10d);
-+
+         c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r10d);
+ 
+-        use->SetFlags<u32>(pass_info.dst_off_dw);
 +        SetFlatbufOffset(use, pass_info.dst_off_dw);
-+        pass_info.dst_off_dw++;
-+    }
-+
-+    // Then visit any children used as pointers
-+    for (const auto [src_off_dw, use] : *use_list) {
-+        if (pass_info.GetUsesAsPointer(use)) {
-+            VisitPointer(src_off_dw, use, pass_info, c);
-+        }
-+    }
-+
-+    PopPtr(c);
-+}
-+
-+static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
-+    Xbyak::CodeGenerator& c = g_srt_codegen;
-+
-+    if (pass_info.srt_roots.empty()) {
-+        return;
-+    }
-+
-+    // Register the signal handler for SRT walker, if not already registered
-+    if (g_srt_codegen_start == nullptr) {
-+        g_srt_codegen_start = c.getCurr();
-+        auto* signals = Core::Signals::Instance();
-+        // Call after the memory invalidation handler
-+        constexpr u32 priority = 1;
-+        signals->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
-+    }
-+
-+    info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
-+    pass_info.dst_off_dw = NUM_USER_DATA_REGS;
-+    ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
-+
-+    for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
+         pass_info.dst_off_dw++;
+     }
+ 
+@@ -232,7 +680,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
+     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
+ 
+     for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
+-        VisitPointer(static_cast<u32>(sgpr_base), root, pass_info, c);
 +        VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, c);
-+    }
-+
-+    c.ret();
-+    c.ready();
-+
-+    info.srt_info.walker_func_size =
-+        c.getCurr() - reinterpret_cast<const u8*>(info.srt_info.walker_func);
-+
-+    if (EmulatorSettings.IsDumpShaders()) {
-+        DumpSrtProgram(info, reinterpret_cast<const u8*>(info.srt_info.walker_func),
-+                       info.srt_info.walker_func_size);
-+    }
-+
-+    info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
-+}
-+
+     }
+ 
+     c.ret();
+@@ -249,72 +697,191 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
+     info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
+ }
+ 
+-}; // namespace
 +static bool IsReadConstSource(const IR::Value base) {
 +    auto* inst = base.TryInst();
 +    if (!inst) {
@@ -374440,19 +372173,27 @@ index 9b2b50f8..bddfc3f4 100644
 +}
 +
 +} // Anonymous namespace
-+
-+void FlattenExtendedUserdataPass(IR::Program& program) {
+ 
+ void FlattenExtendedUserdataPass(IR::Program& program) {
+-    Shader::Info& info = program.info;
 +    auto& post_order = program.post_order_blocks;
-+    PassInfo pass_info;
-+
-+    // traverse at end and assign offsets to duplicate readconsts, using
-+    // vn_to_inst as the source
+     PassInfo pass_info;
+ 
+     // traverse at end and assign offsets to duplicate readconsts, using
+     // vn_to_inst as the source
+-    boost::container::small_vector<IR::Inst*, 32> all_readconsts;
 +    boost::container::small_vector<IR::Inst*, 32> all_readconsts, visited;
 +    std::queue<IR::Inst*> queue;
-+
+ 
+-    for (auto r_it = program.post_order_blocks.rbegin(); r_it != program.post_order_blocks.rend();
+-         r_it++) {
+-        IR::Block* block = *r_it;
 +    for (auto it = post_order.rbegin(); it != post_order.rend(); it++) {
 +        IR::Block* block{*it};
-+        for (IR::Inst& inst : *block) {
+         for (IR::Inst& inst : *block) {
+-            if (inst.GetOpcode() == IR::Opcode::ReadConst) {
+-                if (!inst.Arg(1).IsImmediate()) {
+-                    LOG_WARNING(Render_Recompiler, "ReadConst has non-immediate offset");
 +            if (inst.GetOpcode() != IR::Opcode::ReadConst &&
 +                inst.GetOpcode() != IR::Opcode::ReadConstBuffer) {
 +                continue;
@@ -374463,12 +372204,15 @@ index 9b2b50f8..bddfc3f4 100644
 +                // resource discovery pass
 +                auto inst_info = inst.Flags<IR::BufferInstInfo>();
 +                if (!inst_info.sharp_source) {
-+                    continue;
-+                }
+                     continue;
+                 }
 +            }
 +
 +            SimplifyReadConstAddressAdd(inst);
-+
+ 
+-                all_readconsts.push_back(&inst);
+-                if (pass_info.DeduplicateInstruction(&inst) != &inst) {
+-                    // This is a duplicate of a readconst we've already visited
 +            all_readconsts.push_back(&inst);
 +
 +            auto offset = inst.Arg(1);
@@ -374494,8 +372238,8 @@ index 9b2b50f8..bddfc3f4 100644
 +                            }
 +                        }
 +                    }
-+                    continue;
-+                }
+                     continue;
+                 }
 +                if (inst->GetOpcode() == IR::Opcode::GetUserData ||
 +                    inst->GetOpcode() == IR::Opcode::ReadConst ||
 +                    !IsAllowedOffsetInstruction(inst)) {
@@ -374515,13 +372259,24 @@ index 9b2b50f8..bddfc3f4 100644
 +            }
 +        }
 +    }
-+
+ 
+-                IR::Inst* ptr_composite = inst.Arg(0).InstRecursive();
 +    for (auto inst : all_readconsts) {
 +        if (pass_info.DeduplicateInstruction(inst) != inst) {
 +            // This is a duplicate of a readconst we've already visited
 +            continue;
 +        }
-+
+ 
+-                const auto pred = [](IR::Inst* inst) -> std::optional<IR::Inst*> {
+-                    if (inst->GetOpcode() == IR::Opcode::GetUserData ||
+-                        inst->GetOpcode() == IR::Opcode::ReadConst) {
+-                        return inst;
+-                    }
+-                    return std::nullopt;
+-                };
+-                auto base0 = IR::BreadthFirstSearch(ptr_composite->Arg(0), pred);
+-                auto base1 = IR::BreadthFirstSearch(ptr_composite->Arg(1), pred);
+-                ASSERT_MSG(base0 && base1, "ReadConst not from constant memory");
 +        IR::Inst* base = inst->Arg(0).Inst();
 +        if (auto* inst = base->Arg(0).TryInst();
 +            inst && inst->GetOpcode() == IR::Opcode::ReadFirstLane) {
@@ -374529,375 +372284,71 @@ index 9b2b50f8..bddfc3f4 100644
 +        }
 +        ASSERT_MSG(IsReadConstSource(base->Arg(0)), "ReadConst base low not from constant memory");
 +        ASSERT_MSG(IsReadConstSource(base->Arg(1)), "ReadConst base high not from constant memory");
-+
+ 
+-                IR::Inst* ptr_lo = base0.value();
+-                ptr_lo = pass_info.DeduplicateInstruction(ptr_lo);
 +        IR::Inst* ptr_lo = base->Arg(0).Inst();
 +        ptr_lo = pass_info.DeduplicateInstruction(ptr_lo);
-+
+ 
+-                auto ptr_uses_kv =
+-                    pass_info.pointer_uses.try_emplace(ptr_lo, PassInfo::PtrUserList{});
+-                PassInfo::PtrUserList& user_list = ptr_uses_kv.first->second;
 +        auto ptr_uses_kv = pass_info.pointer_uses.try_emplace(ptr_lo, PassInfo::PtrUserList{});
 +        PassInfo::PtrUserList& user_list = ptr_uses_kv.first->second;
-+
+ 
+-                user_list[inst.Arg(1).U32()] = &inst;
 +        user_list[inst->Arg(1)] = inst;
-+
+ 
+-                if (ptr_lo->GetOpcode() == IR::Opcode::GetUserData) {
+-                    IR::ScalarReg ud_reg = ptr_lo->Arg(0).ScalarReg();
+-                    pass_info.srt_roots[ud_reg] = ptr_lo;
+-                }
+-            }
 +        if (ptr_lo->GetOpcode() == IR::Opcode::GetUserData) {
 +            IR::ScalarReg ud_reg = ptr_lo->Arg(0).ScalarReg();
 +            pass_info.srt_roots[ud_reg] = ptr_lo;
-+        }
-+    }
-+
+         }
+     }
+ 
+-    GenerateSrtProgram(info, pass_info);
 +    GenerateSrtProgram(program.info, pass_info);
-+
-+    // Assign offsets to duplicate readconsts
-+    for (IR::Inst* readconst : all_readconsts) {
-+        ASSERT(pass_info.vn_to_inst.contains(pass_info.gvn_table.GetValueNumber(readconst)));
-+        IR::Inst* original = pass_info.DeduplicateInstruction(readconst);
+ 
+     // Assign offsets to duplicate readconsts
+     for (IR::Inst* readconst : all_readconsts) {
+         ASSERT(pass_info.vn_to_inst.contains(pass_info.gvn_table.GetValueNumber(readconst)));
+         IR::Inst* original = pass_info.DeduplicateInstruction(readconst);
+-        readconst->SetFlags<u32>(original->Flags<u32>());
 +        SetFlatbufOffset(readconst, GetFlatbufOffset(original));
-+    }
-+
+     }
+ 
+-    info.RefreshFlatBuf();
 +    program.info.RefreshFlatBuf();
-+}
-+
-+} // namespace Shader::Optimization
-+
-+#elif defined(ARCH_ARM64) && defined(__linux__)
-+
-+namespace {
-+
-+constexpr u32 Arm64MovX2X0 = 0xaa0003e2;
-+constexpr u32 Arm64PushX2 = 0xf81f0fe2;
-+constexpr u32 Arm64PopX2 = 0xf84107e2;
-+constexpr u32 Arm64LoadPointer = 0xf8646842;
-+constexpr u32 Arm64MaskPointer = 0xd340bc42;
-+constexpr u32 Arm64LoadDataRegisterOffset = 0xb8646843;
-+constexpr u32 Arm64StoreDataRegisterOffset = 0xb8256823;
-+constexpr u32 Arm64Ret = 0xd65f03c0;
-+constexpr size_t MaxSrtCodeRanges = 32768;
-+
-+struct SrtCodeRange {
-+    uintptr_t begin{};
-+    uintptr_t end{};
-+};
-+
-+struct SrtCodeMapping {
-+    u8* data{};
-+    size_t size{};
-+
-+    ~SrtCodeMapping() {
-+        if (data != nullptr) {
-+            munmap(data, size);
-+        }
-+    }
-+};
-+
-+std::array<SrtCodeRange, MaxSrtCodeRanges> g_srt_code_ranges{};
-+std::atomic_size_t g_srt_code_range_count{};
-+std::mutex g_srt_code_mutex;
-+std::vector<std::unique_ptr<SrtCodeMapping>> g_srt_code_mappings;
-+std::once_flag g_srt_signal_once;
-+
-+bool IsSrtCodeAddress(uintptr_t pc) {
-+    const size_t count = g_srt_code_range_count.load(std::memory_order_acquire);
-+    for (size_t index = 0; index < count; ++index) {
-+        const auto& range = g_srt_code_ranges[index];
-+        if (pc >= range.begin && pc < range.end) {
-+            return true;
-+        }
-+    }
-+    return false;
-+}
-+
-+bool SrtWalkerSignalHandler(void* context, void* fault_address) {
-+    const auto pc = reinterpret_cast<uintptr_t>(Common::GetRip(context));
-+    if (!IsSrtCodeAddress(pc)) {
-+        return false;
-+    }
-+
-+    u32 instruction{};
-+    std::memcpy(&instruction, reinterpret_cast<const void*>(pc), sizeof(instruction));
-+    auto* signal_context = static_cast<ucontext_t*>(context);
-+    if (instruction == Arm64LoadPointer) {
-+        signal_context->uc_mcontext.regs[2] = 0;
-+    } else if ((instruction & 0xffc003ffu) == 0xb9400043u ||
-+               instruction == Arm64LoadDataRegisterOffset) {
-+        signal_context->uc_mcontext.regs[3] = 0;
-+    } else {
-+        return false;
-+    }
-+    Common::IncrementRip(context, sizeof(u32));
-+    return true;
-+}
-+
-+bool IsArm64SrtWalker(const u8* ptr, size_t size) {
-+    if (ptr == nullptr || size < sizeof(u32) * 2 || size % sizeof(u32) != 0) {
-+        return false;
-+    }
-+    u32 first{};
-+    u32 last{};
-+    std::memcpy(&first, ptr, sizeof(first));
-+    std::memcpy(&last, ptr + size - sizeof(last), sizeof(last));
-+    return first == Arm64MovX2X0 && last == Arm64Ret;
-+}
-+
-+class Arm64SrtEmitter {
-+public:
-+    void Begin() {
-+        Emit(Arm64MovX2X0);
-+    }
-+
-+    void PushPointer(u32 offset_dw) {
-+        Emit(Arm64PushX2);
-+        MoveImmediate(4, static_cast<u64>(offset_dw) * sizeof(u32));
-+        Emit(Arm64LoadPointer);
-+        Emit(Arm64MaskPointer);
-+    }
-+
-+    void PopPointer() {
-+        Emit(Arm64PopX2);
-+    }
-+
-+    void CopyDword(u32 source_offset_dw, u32 destination_offset_dw) {
-+        if (source_offset_dw <= 0xfff) {
-+            Emit(0xb9400043u | (source_offset_dw << 10));
-+        } else {
-+            MoveImmediate(4, static_cast<u64>(source_offset_dw) * sizeof(u32));
-+            Emit(Arm64LoadDataRegisterOffset);
-+        }
-+
-+        if (destination_offset_dw <= 0xfff) {
-+            Emit(0xb9000023u | (destination_offset_dw << 10));
-+        } else {
-+            MoveImmediate(5, static_cast<u64>(destination_offset_dw) * sizeof(u32));
-+            Emit(Arm64StoreDataRegisterOffset);
-+        }
-+    }
-+
-+    void End() {
-+        Emit(Arm64Ret);
-+    }
-+
-+    const u8* Data() const {
-+        return reinterpret_cast<const u8*>(code.data());
-+    }
-+
-+    size_t Size() const {
-+        return code.size() * sizeof(u32);
-+    }
-+
-+private:
-+    void Emit(u32 instruction) {
-+        code.push_back(instruction);
-+    }
-+
-+    void MoveImmediate(u32 reg, u64 value) {
-+        Emit(0xd2800000u | reg | (static_cast<u32>(value & 0xffff) << 5));
-+        for (u32 halfword = 1; halfword < 4; ++halfword) {
-+            const u32 part = static_cast<u32>((value >> (halfword * 16)) & 0xffff);
-+            if (part != 0) {
-+                Emit(0xf2800000u | reg | (halfword << 21) | (part << 5));
-+            }
-+        }
-+    }
-+
-+    std::vector<u32> code;
-+};
-+
-+using namespace Shader;
-+
-+struct PassInfo {
-+    using PtrUserList = boost::container::flat_map<u32, Shader::IR::Inst*>;
-+
-+    Optimization::SrtGvnTable gvn_table;
-+    std::unordered_map<IR::Inst*, PtrUserList> pointer_uses;
-+    boost::container::small_flat_map<IR::ScalarReg, IR::Inst*, 1> srt_roots;
-+    std::unordered_map<u32, IR::Inst*> vn_to_inst;
-+    u32 dst_off_dw;
-+
-+    PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
-+        auto it = pointer_uses.find(inst);
-+        return it != pointer_uses.end() ? &it->second : nullptr;
-+    }
-+
-+    IR::Inst* DeduplicateInstruction(IR::Inst* inst) {
-+        auto it = vn_to_inst.try_emplace(gvn_table.GetValueNumber(inst), inst);
-+        return it.first->second;
-+    }
-+};
-+
-+} // namespace
-+
-+namespace Shader {
-+
-+PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
-+    if (!IsArm64SrtWalker(ptr, size)) {
-+        LOG_WARNING(Render_Recompiler,
-+                    "Ignoring incompatible cached SRT walker; shader will be recompiled");
-+        return nullptr;
-+    }
-+
-+    std::lock_guard lock{g_srt_code_mutex};
-+    const size_t range_index = g_srt_code_range_count.load(std::memory_order_relaxed);
-+    if (range_index >= g_srt_code_ranges.size()) {
-+        LOG_CRITICAL(Render_Recompiler, "ARM64 SRT walker range table is full");
-+        std::abort();
-+    }
-+
-+    const long page_size_result = sysconf(_SC_PAGESIZE);
-+    if (page_size_result <= 0) {
-+        LOG_CRITICAL(Render_Recompiler, "Unable to query host page size for ARM64 SRT walker");
-+        std::abort();
-+    }
-+    const size_t page_size = static_cast<size_t>(page_size_result);
-+    const size_t mapping_size = (size + page_size - 1) & ~(page_size - 1);
-+    auto mapping = std::make_unique<SrtCodeMapping>();
-+    mapping->data = static_cast<u8*>(
-+        mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-+    mapping->size = mapping_size;
-+    if (mapping->data == MAP_FAILED) {
-+        mapping->data = nullptr;
-+        LOG_CRITICAL(Render_Recompiler, "Unable to allocate ARM64 SRT walker: errno {}", errno);
-+        std::abort();
-+    }
-+    std::memcpy(mapping->data, ptr, size);
-+    __builtin___clear_cache(reinterpret_cast<char*>(mapping->data),
-+                            reinterpret_cast<char*>(mapping->data + size));
-+    if (mprotect(mapping->data, mapping_size, PROT_READ | PROT_EXEC) != 0) {
-+        LOG_CRITICAL(Render_Recompiler, "Unable to protect ARM64 SRT walker: errno {}", errno);
-+        std::abort();
-+    }
-+
-+    std::call_once(g_srt_signal_once, [] {
-+        constexpr u32 priority = 1;
-+        Core::Signals::Instance()->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
-+    });
-+
-+    const auto begin = reinterpret_cast<uintptr_t>(mapping->data);
-+    auto* function = reinterpret_cast<PFN_SrtWalker>(mapping->data);
-+    g_srt_code_mappings.push_back(std::move(mapping));
-+    g_srt_code_ranges[range_index] = {begin, begin + size};
-+    g_srt_code_range_count.store(range_index + 1, std::memory_order_release);
-+    return function;
-+}
-+
-+} // namespace Shader
-+
-+namespace Shader::Optimization {
-+
-+namespace {
-+
-+void VisitPointer(u32 offset_dw, IR::Inst* subtree, PassInfo& pass_info,
-+                  Arm64SrtEmitter& emitter) {
-+    emitter.PushPointer(offset_dw);
-+    PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
-+    ASSERT(use_list);
-+
-+    for (auto [source_offset_dw, use] : *use_list) {
-+        emitter.CopyDword(source_offset_dw, pass_info.dst_off_dw);
-+        use->SetFlags<u32>(pass_info.dst_off_dw++);
-+    }
-+
-+    for (const auto [source_offset_dw, use] : *use_list) {
-+        if (pass_info.GetUsesAsPointer(use)) {
-+            VisitPointer(source_offset_dw, use, pass_info, emitter);
-+        }
-+    }
-+    emitter.PopPointer();
-+}
-+
-+void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
-+    if (pass_info.srt_roots.empty()) {
-+        return;
-+    }
-+
-+    Arm64SrtEmitter emitter;
-+    emitter.Begin();
-+    pass_info.dst_off_dw = NUM_USER_DATA_REGS;
-+    ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
-+    for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
-+        VisitPointer(static_cast<u32>(sgpr_base), root, pass_info, emitter);
-+    }
-+    emitter.End();
-+
-+    info.srt_info.walker_func = RegisterWalkerCode(emitter.Data(), emitter.Size());
-+    ASSERT(info.srt_info.walker_func != nullptr);
-+    info.srt_info.walker_func_size = emitter.Size();
-+    info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
-+}
-+
-+} // namespace
-+
-+void FlattenExtendedUserdataPass(IR::Program& program) {
-+    Shader::Info& info = program.info;
-+    PassInfo pass_info;
-+    boost::container::small_vector<IR::Inst*, 32> all_readconsts;
-+
-+    for (auto r_it = program.post_order_blocks.rbegin(); r_it != program.post_order_blocks.rend();
-+         ++r_it) {
-+        IR::Block* block = *r_it;
-+        for (IR::Inst& inst : *block) {
-+            if (inst.GetOpcode() != IR::Opcode::ReadConst) {
-+                continue;
-+            }
-+            if (!inst.Arg(1).IsImmediate()) {
-+                LOG_WARNING(Render_Recompiler, "ReadConst has non-immediate offset");
-+                continue;
-+            }
-+
-+            all_readconsts.push_back(&inst);
-+            if (pass_info.DeduplicateInstruction(&inst) != &inst) {
-+                continue;
-+            }
-+
-+            IR::Inst* ptr_composite = inst.Arg(0).InstRecursive();
-+            const auto pred = [](IR::Inst* candidate) -> std::optional<IR::Inst*> {
-+                if (candidate->GetOpcode() == IR::Opcode::GetUserData ||
-+                    candidate->GetOpcode() == IR::Opcode::ReadConst) {
-+                    return candidate;
-+                }
-+                return std::nullopt;
-+            };
-+            auto base0 = IR::BreadthFirstSearch(ptr_composite->Arg(0), pred);
-+            auto base1 = IR::BreadthFirstSearch(ptr_composite->Arg(1), pred);
-+            ASSERT_MSG(base0 && base1, "ReadConst not from constant memory");
-+
-+            IR::Inst* ptr_lo = pass_info.DeduplicateInstruction(base0.value());
-+            auto [uses, inserted] =
-+                pass_info.pointer_uses.try_emplace(ptr_lo, PassInfo::PtrUserList{});
-+            uses->second[inst.Arg(1).U32()] = &inst;
-+            if (ptr_lo->GetOpcode() == IR::Opcode::GetUserData) {
-+                pass_info.srt_roots[ptr_lo->Arg(0).ScalarReg()] = ptr_lo;
-+            }
-+        }
-+    }
-+
-+    GenerateSrtProgram(info, pass_info);
-+    for (IR::Inst* readconst : all_readconsts) {
-+        ASSERT(pass_info.vn_to_inst.contains(pass_info.gvn_table.GetValueNumber(readconst)));
-+        IR::Inst* original = pass_info.DeduplicateInstruction(readconst);
-+        readconst->SetFlags<u32>(original->Flags<u32>());
-+    }
-+    info.RefreshFlatBuf();
-+}
-+
-+} // namespace Shader::Optimization
-+
-+#else
-+
-+namespace Shader {
-+
-+PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
-+    UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");
-+}
-+
-+namespace Optimization {
-+
-+void FlattenExtendedUserdataPass(IR::Program& program) {
-+    UNREACHABLE_MSG("FlattenExtendedUserdataPass unimplemented for target architecture.");
-+}
-+
-+} // namespace Optimization
-+
-+} // namespace Shader
-+
-+#endif
+ }
+ 
+ } // namespace Shader::Optimization
+@@ -607,7 +1174,7 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
+                 continue;
+             }
+ 
+-            IR::Inst* ptr_composite = inst.Arg(0).InstRecursive();
++            IR::Inst* ptr_composite = InstRecursive(inst.Arg(0));
+             const auto pred = [](IR::Inst* candidate) -> std::optional<IR::Inst*> {
+                 if (candidate->GetOpcode() == IR::Opcode::GetUserData ||
+                     candidate->GetOpcode() == IR::Opcode::ReadConst) {
+@@ -615,8 +1182,11 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
+                 }
+                 return std::nullopt;
+             };
+-            auto base0 = IR::BreadthFirstSearch(ptr_composite->Arg(0), pred);
+-            auto base1 = IR::BreadthFirstSearch(ptr_composite->Arg(1), pred);
++            // Pass Inst* rather than Value: the pred is a stateless lambda, so the const-Value
++            // overload would deduce a const Inst* result and hand back a pointer that
++            // DeduplicateInstruction (which takes Inst*) cannot consume.
++            auto base0 = IR::BreadthFirstSearch(ptr_composite->Arg(0).TryInst(), pred);
++            auto base1 = IR::BreadthFirstSearch(ptr_composite->Arg(1).TryInst(), pred);
+             ASSERT_MSG(base0 && base1, "ReadConst not from constant memory");
+ 
+             IR::Inst* ptr_lo = pass_info.DeduplicateInstruction(base0.value());
 diff --git a/src/shader_recompiler/ir/passes/hull_shader_transform.cpp b/src/shader_recompiler/ir/passes/hull_shader_transform.cpp
 index c5be5803..0cd2b2f4 100644
 --- a/src/shader_recompiler/ir/passes/hull_shader_transform.cpp
@@ -407513,31 +404964,16 @@ index fce109a7..a3ba3cb7 100644
 +
 +} // namespace VideoCore
 diff --git a/src/video_core/buffer_cache/fault_manager.cpp b/src/video_core/buffer_cache/fault_manager.cpp
-index 3c031536..e7b3adba 100644
+index 3c031536..b8b728ff 100644
 --- a/src/video_core/buffer_cache/fault_manager.cpp
 +++ b/src/video_core/buffer_cache/fault_manager.cpp
-@@ -1,193 +1,184 @@
--// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
--// SPDX-License-Identifier: GPL-2.0-or-later
--
--#include "common/div_ceil.h"
--#include "video_core/buffer_cache/buffer_cache.h"
--#include "video_core/buffer_cache/fault_manager.h"
--#include "video_core/renderer_vulkan/vk_instance.h"
--#include "video_core/renderer_vulkan/vk_platform.h"
--#include "video_core/renderer_vulkan/vk_scheduler.h"
--#include "video_core/renderer_vulkan/vk_shader_util.h"
--
--#include "video_core/host_shaders/fault_buffer_process_comp.h"
--
--namespace VideoCore {
--
--static constexpr size_t MaxPageFaults = 1024;
--static constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(u64);
--
--FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler_,
+@@ -17,15 +17,12 @@ static constexpr size_t MaxPageFaults = 1024;
+ static constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(u64);
+ 
+ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler_,
 -                           BufferCache& buffer_cache_, u32 caching_pagebits, u64 caching_num_pages_)
--    : instance{instance}, scheduler{scheduler_}, buffer_cache{buffer_cache_},
++                           BufferCache& buffer_cache_, u32 sparse_pagebits, u64 sparse_num_pages_)
+     : instance{instance}, scheduler{scheduler_}, buffer_cache{buffer_cache_},
 -      caching_pagesize{1ULL << caching_pagebits}, caching_num_pages{caching_num_pages_},
 -      fault_buffer_size{caching_num_pages / 8},
 -      fault_buffer{instance, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, fault_buffer_size},
@@ -407545,126 +404981,59 @@ index 3c031536..e7b3adba 100644
 -                      0,        AllFlags,  MaxPendingFaults * PageFaultAreaSize},
 -      uses_push_descriptors{instance.IsPushDescriptorSupported()},
 -      desc_heap{instance, scheduler.GetMasterSemaphore(), pool_sizes, 64} {
--    const auto device = instance.GetDevice();
--    Vulkan::SetObjectName(device, fault_buffer.Handle(), "Fault Buffer");
--
--    const std::array<vk::DescriptorSetLayoutBinding, 2> bindings = {{
--        {
--            .binding = 0,
--            .descriptorType = vk::DescriptorType::eStorageBuffer,
--            .descriptorCount = 1,
--            .stageFlags = vk::ShaderStageFlagBits::eCompute,
--        },
--        {
--            .binding = 1,
--            .descriptorType = vk::DescriptorType::eStorageBuffer,
--            .descriptorCount = 1,
--            .stageFlags = vk::ShaderStageFlagBits::eCompute,
--        },
--    }};
++      sparse_pagesize{1ULL << sparse_pagebits}, sparse_num_pages{sparse_num_pages_},
++      fault_buffer_size{sparse_num_pages_ / 8},
++      fault_buffer{instance, 0, fault_buffer_size, MemoryType::DeviceLocal},
++      download_buffer{instance, 0, MaxPendingFaults * PageFaultAreaSize, MemoryType::HostCached} {
+     const auto device = instance.GetDevice();
+     Vulkan::SetObjectName(device, fault_buffer.Handle(), "Fault Buffer");
+ 
+@@ -43,27 +40,33 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler&
+             .stageFlags = vk::ShaderStageFlagBits::eCompute,
+         },
+     }};
 -    const vk::DescriptorSetLayoutCreateFlags layout_flags =
 -        uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
 -                              : vk::DescriptorSetLayoutCreateFlagBits{};
--    const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
+     const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
 -        .flags = layout_flags,
--        .bindingCount = 2,
--        .pBindings = bindings.data(),
--    };
--    fault_process_desc_layout =
--        Vulkan::Check(device.createDescriptorSetLayoutUnique(desc_layout_ci));
--
++        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+         .bindingCount = 2,
+         .pBindings = bindings.data(),
+     };
+     fault_process_desc_layout =
+         Vulkan::Check(device.createDescriptorSetLayoutUnique(desc_layout_ci));
+ 
 -    std::vector<std::string> defines{{fmt::format("CACHING_PAGEBITS={}", caching_pagebits),
 -                                      fmt::format("MAX_PAGE_FAULTS={}", MaxPageFaults)}};
 -    const auto module = Vulkan::Compile(HostShaders::FAULT_BUFFER_PROCESS_COMP,
 -                                        vk::ShaderStageFlagBits::eCompute, device, defines);
--    Vulkan::SetObjectName(device, module, "Fault Buffer Parser");
--
--    const vk::PipelineShaderStageCreateInfo shader_ci = {
--        .stage = vk::ShaderStageFlagBits::eCompute,
--        .module = module,
--        .pName = "main",
--    };
--
--    const vk::PipelineLayoutCreateInfo layout_info = {
--        .setLayoutCount = 1U,
--        .pSetLayouts = &(*fault_process_desc_layout),
--    };
--    fault_process_pipeline_layout = Vulkan::Check(device.createPipelineLayoutUnique(layout_info));
--
--    const vk::ComputePipelineCreateInfo pipeline_info = {
--        .stage = shader_ci,
--        .layout = *fault_process_pipeline_layout,
--    };
--    fault_process_pipeline = Vulkan::Check(device.createComputePipelineUnique({}, pipeline_info));
--    Vulkan::SetObjectName(device, *fault_process_pipeline, "Fault Buffer Parser Pipeline");
--
--    device.destroyShaderModule(module);
--}
--
--void FaultManager::ProcessFaultBuffer() {
--    if (u64 wait_tick = fault_areas[current_area]) {
--        scheduler.Wait(wait_tick);
--        scheduler.PopPendingOperations();
--    }
--
--    const u32 offset = current_area * PageFaultAreaSize;
--    u8* mapped = download_buffer.mapped_data.data() + offset;
--    std::memset(mapped, 0, PageFaultAreaSize);
--
--    const vk::BufferMemoryBarrier2 pre_barrier = {
--        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
--        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
--        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
--        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
--        .buffer = fault_buffer.Handle(),
--        .offset = 0,
--        .size = fault_buffer_size,
--    };
--    const vk::BufferMemoryBarrier2 post_barrier = {
--        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
--        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
--        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
--        .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
--        .buffer = fault_buffer.Handle(),
--        .offset = 0,
--        .size = fault_buffer_size,
--    };
--    const vk::DescriptorBufferInfo fault_buffer_info = {
--        .buffer = fault_buffer.Handle(),
--        .offset = 0,
--        .range = fault_buffer_size,
--    };
--    const vk::DescriptorBufferInfo download_info = {
--        .buffer = download_buffer.Handle(),
--        .offset = offset,
--        .range = PageFaultAreaSize,
--    };
--    const std::array<vk::WriteDescriptorSet, 2> writes = {{
--        {
--            .dstSet = VK_NULL_HANDLE,
--            .dstBinding = 0,
--            .dstArrayElement = 0,
--            .descriptorCount = 1,
--            .descriptorType = vk::DescriptorType::eStorageBuffer,
--            .pBufferInfo = &fault_buffer_info,
--        },
--        {
--            .dstSet = VK_NULL_HANDLE,
--            .dstBinding = 1,
--            .dstArrayElement = 0,
--            .descriptorCount = 1,
--            .descriptorType = vk::DescriptorType::eStorageBuffer,
--            .pBufferInfo = &download_info,
--        },
--    }};
--    scheduler.EndRendering();
--    const auto cmdbuf = scheduler.CommandBuffer();
--    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
--        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
--        .bufferMemoryBarrierCount = 1,
--        .pBufferMemoryBarriers = &pre_barrier,
--    });
--    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
++    const std::array<u32, 2> spec_data{sparse_pagebits, MaxPageFaults};
++    const std::array<vk::SpecializationMapEntry, 2> spec_entries{{
++        {0, 0, sizeof(u32)},
++        {1, sizeof(u32), sizeof(u32)},
++    }};
++    const vk::SpecializationInfo specialization{
++        .mapEntryCount = static_cast<u32>(spec_entries.size()),
++        .pMapEntries = spec_entries.data(),
++        .dataSize = sizeof(spec_data),
++        .pData = spec_data.data(),
++    };
++    const auto module = Vulkan::CompileSPV(FAULT_BUFFER_PROCESS_COMP, device);
+     Vulkan::SetObjectName(device, module, "Fault Buffer Parser");
+ 
+     const vk::PipelineShaderStageCreateInfo shader_ci = {
+         .stage = vk::ShaderStageFlagBits::eCompute,
+         .module = module,
+         .pName = "main",
++        .pSpecializationInfo = &specialization,
+     };
+ 
+     const vk::PipelineLayoutCreateInfo layout_info = {
+@@ -146,21 +149,10 @@ void FaultManager::ProcessFaultBuffer() {
+         .pBufferMemoryBarriers = &pre_barrier,
+     });
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
 -    if (uses_push_descriptors) {
 -        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout,
 -                                    0, writes);
@@ -407678,327 +405047,54 @@ index 3c031536..e7b3adba 100644
 -        cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
 -                                  desc_set, {});
 -    }
--    // 1 bit per page, 32 pages per workgroup
--    const u32 num_threads = caching_num_pages / 32;
--    const u32 num_workgroups = Common::DivCeil(num_threads, 64u);
--    cmdbuf.dispatch(num_workgroups, 1, 1);
--
--    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
--        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
--        .bufferMemoryBarrierCount = 1,
--        .pBufferMemoryBarriers = &post_barrier,
--    });
--
--    scheduler.DeferOperation([this, mapped, area = current_area] {
--        fault_ranges.Clear();
--        const u64* fault_buf = std::bit_cast<const u64*>(mapped);
--        const u32 fault_count = fault_buf[0];
--        for (u32 i = 1; i <= fault_count; ++i) {
--            fault_ranges.Add(fault_buf[i], caching_pagesize);
--            LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);
--        }
--        fault_ranges.ForEach([&](VAddr start, VAddr end) {
--            ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
--                       "Buffer size is too large");
--            buffer_cache.FindBuffer(start, static_cast<u32>(end - start));
--        });
--        fault_areas[area] = 0;
--    });
--
--    fault_areas[current_area++] = scheduler.CurrentTick();
--    current_area %= MaxPendingFaults;
--}
--
--} // namespace VideoCore
-+// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+
-+#include "common/div_ceil.h"
-+#include "video_core/buffer_cache/buffer_cache.h"
-+#include "video_core/buffer_cache/fault_manager.h"
-+#include "video_core/renderer_vulkan/vk_instance.h"
-+#include "video_core/renderer_vulkan/vk_platform.h"
-+#include "video_core/renderer_vulkan/vk_scheduler.h"
-+#include "video_core/renderer_vulkan/vk_shader_util.h"
-+
-+#include "video_core/host_shaders/fault_buffer_process_comp.h"
-+
-+namespace VideoCore {
-+
-+static constexpr size_t MaxPageFaults = 1024;
-+static constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(u64);
-+
-+FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler_,
-+                           BufferCache& buffer_cache_, u32 sparse_pagebits, u64 sparse_num_pages_)
-+    : scheduler{scheduler_}, buffer_cache{buffer_cache_}, sparse_pagesize{1ULL << sparse_pagebits},
-+      sparse_num_pages{sparse_num_pages_}, fault_buffer_size{sparse_num_pages_ / 8},
-+      fault_buffer{instance, 0, fault_buffer_size, MemoryType::DeviceLocal},
-+      download_buffer{instance, 0, MaxPendingFaults * PageFaultAreaSize, MemoryType::HostCached} {
-+    const auto device = instance.GetDevice();
-+    Vulkan::SetObjectName(device, fault_buffer.Handle(), "Fault Buffer");
-+
-+    const std::array<vk::DescriptorSetLayoutBinding, 2> bindings = {{
-+        {
-+            .binding = 0,
-+            .descriptorType = vk::DescriptorType::eStorageBuffer,
-+            .descriptorCount = 1,
-+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-+        },
-+        {
-+            .binding = 1,
-+            .descriptorType = vk::DescriptorType::eStorageBuffer,
-+            .descriptorCount = 1,
-+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-+        },
-+    }};
-+    const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
-+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
-+        .bindingCount = 2,
-+        .pBindings = bindings.data(),
-+    };
-+    fault_process_desc_layout =
-+        Vulkan::Check(device.createDescriptorSetLayoutUnique(desc_layout_ci));
-+
-+    const std::array<u32, 2> spec_data{sparse_pagebits, MaxPageFaults};
-+    const std::array<vk::SpecializationMapEntry, 2> spec_entries{{
-+        {0, 0, sizeof(u32)},
-+        {1, sizeof(u32), sizeof(u32)},
-+    }};
-+    const vk::SpecializationInfo specialization{
-+        .mapEntryCount = static_cast<u32>(spec_entries.size()),
-+        .pMapEntries = spec_entries.data(),
-+        .dataSize = sizeof(spec_data),
-+        .pData = spec_data.data(),
-+    };
-+    const auto module = Vulkan::CompileSPV(FAULT_BUFFER_PROCESS_COMP, device);
-+    Vulkan::SetObjectName(device, module, "Fault Buffer Parser");
-+
-+    const vk::PipelineShaderStageCreateInfo shader_ci = {
-+        .stage = vk::ShaderStageFlagBits::eCompute,
-+        .module = module,
-+        .pName = "main",
-+        .pSpecializationInfo = &specialization,
-+    };
-+
-+    const vk::PipelineLayoutCreateInfo layout_info = {
-+        .setLayoutCount = 1U,
-+        .pSetLayouts = &(*fault_process_desc_layout),
-+    };
-+    fault_process_pipeline_layout = Vulkan::Check(device.createPipelineLayoutUnique(layout_info));
-+
-+    const vk::ComputePipelineCreateInfo pipeline_info = {
-+        .stage = shader_ci,
-+        .layout = *fault_process_pipeline_layout,
-+    };
-+    fault_process_pipeline = Vulkan::Check(device.createComputePipelineUnique({}, pipeline_info));
-+    Vulkan::SetObjectName(device, *fault_process_pipeline, "Fault Buffer Parser Pipeline");
-+
-+    device.destroyShaderModule(module);
-+}
-+
-+void FaultManager::ProcessFaultBuffer() {
-+    if (u64 wait_tick = fault_areas[current_area]) {
-+        scheduler.Wait(wait_tick);
-+        scheduler.PopPendingOperations();
-+    }
-+
-+    const u32 offset = current_area * PageFaultAreaSize;
-+    u8* mapped = download_buffer.mapped_data.data() + offset;
-+    std::memset(mapped, 0, PageFaultAreaSize);
-+
-+    const vk::BufferMemoryBarrier2 pre_barrier = {
-+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
-+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-+        .buffer = fault_buffer.Handle(),
-+        .offset = 0,
-+        .size = fault_buffer_size,
-+    };
-+    const vk::BufferMemoryBarrier2 post_barrier = {
-+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
-+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-+        .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
-+        .buffer = fault_buffer.Handle(),
-+        .offset = 0,
-+        .size = fault_buffer_size,
-+    };
-+    const vk::DescriptorBufferInfo fault_buffer_info = {
-+        .buffer = fault_buffer.Handle(),
-+        .offset = 0,
-+        .range = fault_buffer_size,
-+    };
-+    const vk::DescriptorBufferInfo download_info = {
-+        .buffer = download_buffer.Handle(),
-+        .offset = offset,
-+        .range = PageFaultAreaSize,
-+    };
-+    const std::array<vk::WriteDescriptorSet, 2> writes = {{
-+        {
-+            .dstSet = VK_NULL_HANDLE,
-+            .dstBinding = 0,
-+            .dstArrayElement = 0,
-+            .descriptorCount = 1,
-+            .descriptorType = vk::DescriptorType::eStorageBuffer,
-+            .pBufferInfo = &fault_buffer_info,
-+        },
-+        {
-+            .dstSet = VK_NULL_HANDLE,
-+            .dstBinding = 1,
-+            .dstArrayElement = 0,
-+            .descriptorCount = 1,
-+            .descriptorType = vk::DescriptorType::eStorageBuffer,
-+            .pBufferInfo = &download_info,
-+        },
-+    }};
-+    scheduler.EndRendering();
-+    const auto cmdbuf = scheduler.CommandBuffer();
-+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-+        .bufferMemoryBarrierCount = 1,
-+        .pBufferMemoryBarriers = &pre_barrier,
-+    });
-+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
 +    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
 +                                writes);
-+    // 1 bit per page, 32 pages per workgroup
+     // 1 bit per page, 32 pages per workgroup
+-    const u32 num_threads = caching_num_pages / 32;
 +    const u32 num_threads = sparse_num_pages / 32;
-+    const u32 num_workgroups = Common::DivCeil(num_threads, 64u);
-+    cmdbuf.dispatch(num_workgroups, 1, 1);
-+
-+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-+        .bufferMemoryBarrierCount = 1,
-+        .pBufferMemoryBarriers = &post_barrier,
-+    });
-+
-+    scheduler.DeferOperation([this, mapped, area = current_area] {
-+        fault_ranges.Clear();
-+        const u64* fault_buf = std::bit_cast<const u64*>(mapped);
-+        const u32 fault_count = fault_buf[0];
-+        for (u32 i = 1; i <= fault_count; ++i) {
+     const u32 num_workgroups = Common::DivCeil(num_threads, 64u);
+     cmdbuf.dispatch(num_workgroups, 1, 1);
+ 
+@@ -175,13 +167,13 @@ void FaultManager::ProcessFaultBuffer() {
+         const u64* fault_buf = std::bit_cast<const u64*>(mapped);
+         const u32 fault_count = fault_buf[0];
+         for (u32 i = 1; i <= fault_count; ++i) {
+-            fault_ranges.Add(fault_buf[i], caching_pagesize);
 +            fault_ranges.Add(fault_buf[i], sparse_pagesize);
-+            LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);
-+        }
-+        fault_ranges.ForEach([&](VAddr start, VAddr end) {
-+            ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
-+                       "Buffer size is too large");
+             LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);
+         }
+         fault_ranges.ForEach([&](VAddr start, VAddr end) {
+             ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
+                        "Buffer size is too large");
+-            buffer_cache.FindBuffer(start, static_cast<u32>(end - start));
 +            (void)buffer_cache.ObtainBuffer(start, end - start);
-+        });
-+        fault_areas[area] = 0;
-+    });
-+
-+    fault_areas[current_area++] = scheduler.CurrentTick();
-+    current_area %= MaxPendingFaults;
-+}
-+
-+} // namespace VideoCore
+         });
+         fault_areas[area] = 0;
+     });
 diff --git a/src/video_core/buffer_cache/fault_manager.h b/src/video_core/buffer_cache/fault_manager.h
 index 54ebe335..c3b0220b 100644
 --- a/src/video_core/buffer_cache/fault_manager.h
 +++ b/src/video_core/buffer_cache/fault_manager.h
-@@ -1,50 +1,50 @@
--// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
--// SPDX-License-Identifier: GPL-2.0-or-later
--
--#pragma once
--
--#include "video_core/buffer_cache/buffer.h"
--#include "video_core/buffer_cache/range_set.h"
--#include "video_core/renderer_vulkan/vk_resource_pool.h"
--
--namespace VideoCore {
--
--class BufferCache;
--
--class FaultManager {
--    static constexpr size_t MaxPendingFaults = 8;
--
--public:
--    explicit FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+@@ -16,7 +16,7 @@ class FaultManager {
+ 
+ public:
+     explicit FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
 -                          BufferCache& buffer_cache, u32 caching_pagebits, u64 caching_num_pages);
--
--    [[nodiscard]] Buffer* GetFaultBuffer() noexcept {
--        return &fault_buffer;
--    }
--
--    void ProcessFaultBuffer();
--
--private:
--    const Vulkan::Instance& instance;
--    Vulkan::Scheduler& scheduler;
--    BufferCache& buffer_cache;
--    RangeSet fault_ranges;
++                          BufferCache& buffer_cache, u32 sparse_pagebits, u64 sparse_num_pages);
+ 
+     [[nodiscard]] Buffer* GetFaultBuffer() noexcept {
+         return &fault_buffer;
+@@ -29,8 +29,8 @@ private:
+     Vulkan::Scheduler& scheduler;
+     BufferCache& buffer_cache;
+     RangeSet fault_ranges;
 -    u64 caching_pagesize;
 -    u64 caching_num_pages;
--    u64 fault_buffer_size;
--    Buffer fault_buffer;
--    Buffer download_buffer;
--    std::array<u64, MaxPendingFaults> fault_areas{};
--    u32 current_area{};
--    bool uses_push_descriptors{};
--    // Pool sizes must outlive desc_heap (DescriptorHeap stores a span to it).
--    static constexpr std::array<vk::DescriptorPoolSize, 1> pool_sizes{{
--        {vk::DescriptorType::eStorageBuffer, 64},
--    }};
--    Vulkan::DescriptorHeap desc_heap;
--    vk::UniqueDescriptorSetLayout fault_process_desc_layout;
--    vk::UniquePipeline fault_process_pipeline;
--    vk::UniquePipelineLayout fault_process_pipeline_layout;
--};
--
--} // namespace VideoCore
-+// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+
-+#pragma once
-+
-+#include "video_core/buffer_cache/buffer.h"
-+#include "video_core/buffer_cache/range_set.h"
-+#include "video_core/renderer_vulkan/vk_resource_pool.h"
-+
-+namespace VideoCore {
-+
-+class BufferCache;
-+
-+class FaultManager {
-+    static constexpr size_t MaxPendingFaults = 8;
-+
-+public:
-+    explicit FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-+                          BufferCache& buffer_cache, u32 sparse_pagebits, u64 sparse_num_pages);
-+
-+    [[nodiscard]] Buffer* GetFaultBuffer() noexcept {
-+        return &fault_buffer;
-+    }
-+
-+    void ProcessFaultBuffer();
-+
-+private:
-+    const Vulkan::Instance& instance;
-+    Vulkan::Scheduler& scheduler;
-+    BufferCache& buffer_cache;
-+    RangeSet fault_ranges;
 +    u64 sparse_pagesize;
 +    u64 sparse_num_pages;
-+    u64 fault_buffer_size;
-+    Buffer fault_buffer;
-+    Buffer download_buffer;
-+    std::array<u64, MaxPendingFaults> fault_areas{};
-+    u32 current_area{};
-+    bool uses_push_descriptors{};
-+    // Pool sizes must outlive desc_heap (DescriptorHeap stores a span to it).
-+    static constexpr std::array<vk::DescriptorPoolSize, 1> pool_sizes{{
-+        {vk::DescriptorType::eStorageBuffer, 64},
-+    }};
-+    Vulkan::DescriptorHeap desc_heap;
-+    vk::UniqueDescriptorSetLayout fault_process_desc_layout;
-+    vk::UniquePipeline fault_process_pipeline;
-+    vk::UniquePipelineLayout fault_process_pipeline_layout;
-+};
-+
-+} // namespace VideoCore
+     u64 fault_buffer_size;
+     Buffer fault_buffer;
+     Buffer download_buffer;
 diff --git a/src/video_core/buffer_cache/memory_tracker.h b/src/video_core/buffer_cache/memory_tracker.h
 index a093be8d..2546a2d5 100644
 --- a/src/video_core/buffer_cache/memory_tracker.h
@@ -434361,241 +431457,74 @@ index 543e144d..0eb3b124 100644
 +
 +} // namespace VideoCore
 diff --git a/src/video_core/texture_cache/image_view.cpp b/src/video_core/texture_cache/image_view.cpp
-index 28f6e17e..0d076772 100644
+index 28f6e17e..b4ae1822 100644
 --- a/src/video_core/texture_cache/image_view.cpp
 +++ b/src/video_core/texture_cache/image_view.cpp
-@@ -1,132 +1,162 @@
--// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
--// SPDX-License-Identifier: GPL-2.0-or-later
--
--#include "common/logging/log.h"
--#include "shader_recompiler/resource.h"
--#include "video_core/renderer_vulkan/liverpool_to_vk.h"
--#include "video_core/renderer_vulkan/vk_instance.h"
--#include "video_core/texture_cache/image.h"
--#include "video_core/texture_cache/image_view.h"
--
--#include <magic_enum/magic_enum.hpp>
--
--namespace VideoCore {
--
--vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
--    switch (type) {
--    case AmdGpu::ImageType::Color1D:
+@@ -3,10 +3,12 @@
+ 
+ #include "common/logging/log.h"
+ #include "shader_recompiler/resource.h"
++#include "video_core/amdgpu/pixel_format.h"
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/texture_cache/image.h"
+ #include "video_core/texture_cache/image_view.h"
++#include "vulkan/vulkan.hpp"
+ 
+ #include <magic_enum/magic_enum.hpp>
+ 
+@@ -15,13 +17,12 @@ namespace VideoCore {
+ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
+     switch (type) {
+     case AmdGpu::ImageType::Color1D:
 -        return vk::ImageViewType::e1D;
 -    case AmdGpu::ImageType::Color1DArray:
 -        return vk::ImageViewType::e1DArray;
--    case AmdGpu::ImageType::Color2D:
--    case AmdGpu::ImageType::Color2DMsaa:
--        return vk::ImageViewType::e2D;
--    case AmdGpu::ImageType::Color2DArray:
--        return vk::ImageViewType::e2DArray;
--    case AmdGpu::ImageType::Color3D:
--        return vk::ImageViewType::e3D;
--    default:
--        UNREACHABLE();
--    }
--}
--
--ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept
--    : is_storage{desc.is_written} {
--    const auto dfmt = image.GetDataFmt();
--    auto nfmt = image.GetNumberFmt();
--    if (is_storage && nfmt == AmdGpu::NumberFormat::Srgb) {
--        nfmt = AmdGpu::NumberFormat::Unorm;
--    }
--    format = Vulkan::LiverpoolToVK::SurfaceFormat(dfmt, nfmt);
--    if (desc.is_depth) {
--        format = Vulkan::LiverpoolToVK::PromoteFormatToDepth(format);
--    }
--
+     case AmdGpu::ImageType::Color2D:
+     case AmdGpu::ImageType::Color2DMsaa:
+         return vk::ImageViewType::e2D;
++    case AmdGpu::ImageType::Color1DArray:
+     case AmdGpu::ImageType::Color2DArray:
++    case AmdGpu::ImageType::Cube:
+         return vk::ImageViewType::e2DArray;
+     case AmdGpu::ImageType::Color3D:
+         return vk::ImageViewType::e3D;
+@@ -30,6 +31,11 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
+     }
+ }
+ 
++// IsViewTypeCompatible lives inline in image_view.h. The out-of-line copy that used to sit here
++// was a stale duplicate: it handled ImageType::Cube and let any of 1D/2D/3D back almost any
++// view type, which contradicts the 1D-as-2D hosting path (Is1DHostedAs2D) the header encodes.
++// Keep exactly one definition -- the header one -- so the two cannot drift again.
++
+ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept
+     : is_storage{desc.is_written} {
+     const auto dfmt = image.GetDataFmt();
+@@ -42,14 +48,14 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
+         format = Vulkan::LiverpoolToVK::PromoteFormatToDepth(format);
+     }
+ 
 -    range.base.level = image.base_level;
 -    range.base.layer = image.base_array;
--    range.extent.levels = image.NumViewLevels(desc.is_array);
--    range.extent.layers = image.NumViewLayers(desc.is_array);
--    type = desc.GetHostViewType(image);
--
--    if (!is_storage) {
--        mapping = Vulkan::LiverpoolToVK::ComponentMapping(image.DstSelect());
--    }
--}
--
--ImageViewInfo::ImageViewInfo(const AmdGpu::ColorBuffer& col_buffer) noexcept {
--    range.base.layer = col_buffer.BaseSlice();
--    range.extent.layers = col_buffer.NumSlices() - range.base.layer;
--    type = range.extent.layers > 1 ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
--    format =
--        Vulkan::LiverpoolToVK::SurfaceFormat(col_buffer.GetDataFmt(), col_buffer.GetNumberFmt());
--}
--
--ImageViewInfo::ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::DepthView view,
--                             AmdGpu::DepthControl ctl) {
--    format = Vulkan::LiverpoolToVK::DepthFormat(depth_buffer.z_info.format,
--                                                depth_buffer.stencil_info.format);
--    is_storage = ctl.depth_write_enable;
--    range.base.layer = view.slice_start;
--    range.extent.layers = view.NumSlices() - range.base.layer;
--    type = range.extent.layers > 1 ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
--}
--
--ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info_,
--                     const Image& image)
--    : info{info_} {
--    vk::ImageViewUsageCreateInfo usage_ci{.usage = image.usage_flags};
--    if (!info.is_storage) {
--        usage_ci.usage &= ~vk::ImageUsageFlagBits::eStorage;
--    }
--    // When sampling D32/D16 texture from shader, the T# specifies R32/R16 format so adjust it.
--    vk::Format format = info.format;
--    vk::ImageAspectFlags aspect = image.aspect_mask;
--    if (image.aspect_mask & vk::ImageAspectFlagBits::eDepth &&
--        Vulkan::LiverpoolToVK::IsFormatDepthCompatible(format)) {
--        format = image.info.pixel_format;
--        aspect = vk::ImageAspectFlagBits::eDepth;
--    }
--    if (image.aspect_mask & vk::ImageAspectFlagBits::eStencil &&
--        Vulkan::LiverpoolToVK::IsFormatStencilCompatible(format)) {
--        format = image.info.pixel_format;
--        aspect = vk::ImageAspectFlagBits::eStencil;
--    }
--
--    const vk::ImageViewCreateInfo image_view_ci = {
--        .pNext = &usage_ci,
--        .image = image.GetImage(),
--        .viewType = ConvertImageViewType(info.type),
--        .format = instance.GetSupportedFormat(format, image.format_features),
--        .components = info.mapping,
--        .subresourceRange{
--            .aspectMask = aspect,
--            .baseMipLevel = info.range.base.level,
--            .levelCount = info.range.extent.levels,
--            .baseArrayLayer = info.range.base.layer,
--            .layerCount = info.range.extent.layers,
--        },
--    };
--    if (!IsViewTypeCompatible(info.type, image.info.type)) {
--        LOG_ERROR(Render_Vulkan, "image view type {} is incompatible with image type {}",
--                  magic_enum::enum_name(info.type), magic_enum::enum_name(image.info.type));
--    }
--
--    auto [view_result, view] = instance.GetDevice().createImageViewUnique(image_view_ci);
--    ASSERT_MSG(view_result == vk::Result::eSuccess, "Failed to create image view: {}",
--               vk::to_string(view_result));
--    image_view = std::move(view);
--
--    const auto view_aspect = aspect & vk::ImageAspectFlagBits::eDepth     ? "Depth"
--                             : aspect & vk::ImageAspectFlagBits::eStencil ? "Stencil"
--                                                                          : "Color";
--    Vulkan::SetObjectName(
--        instance.GetDevice(), *image_view, "ImageView {}x{}x{} {:#x}:{:#x} {}:{} {}:{} ({})",
--        image.info.size.width, image.info.size.height, image.info.size.depth,
--        image.info.guest_address, image.info.guest_size, info.range.base.level,
--        info.range.base.level + info.range.extent.levels - 1, info.range.base.layer,
--        info.range.base.layer + info.range.extent.layers - 1, view_aspect);
--}
--
--ImageView::~ImageView() = default;
--
--} // namespace VideoCore
-+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+
-+#include "common/logging/log.h"
-+#include "shader_recompiler/resource.h"
-+#include "video_core/amdgpu/pixel_format.h"
-+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
-+#include "video_core/renderer_vulkan/vk_instance.h"
-+#include "video_core/texture_cache/image.h"
-+#include "video_core/texture_cache/image_view.h"
-+#include "vulkan/vulkan.hpp"
-+
-+#include <magic_enum/magic_enum.hpp>
-+
-+namespace VideoCore {
-+
-+vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
-+    switch (type) {
-+    case AmdGpu::ImageType::Color1D:
-+    case AmdGpu::ImageType::Color2D:
-+    case AmdGpu::ImageType::Color2DMsaa:
-+        return vk::ImageViewType::e2D;
-+    case AmdGpu::ImageType::Color1DArray:
-+    case AmdGpu::ImageType::Color2DArray:
-+    case AmdGpu::ImageType::Cube:
-+        return vk::ImageViewType::e2DArray;
-+    case AmdGpu::ImageType::Color3D:
-+        return vk::ImageViewType::e3D;
-+    default:
-+        UNREACHABLE();
-+    }
-+}
-+
-+bool IsViewTypeCompatible(AmdGpu::ImageType view_type, AmdGpu::ImageType image_type) {
-+    switch (view_type) {
-+    case AmdGpu::ImageType::Color1D:
-+    case AmdGpu::ImageType::Color1DArray:
-+    case AmdGpu::ImageType::Color2D:
-+    case AmdGpu::ImageType::Color2DArray:
-+    case AmdGpu::ImageType::Color2DMsaa:
-+    case AmdGpu::ImageType::Color2DMsaaArray:
-+    case AmdGpu::ImageType::Cube:
-+        return image_type == AmdGpu::ImageType::Color1D ||
-+               image_type == AmdGpu::ImageType::Color2D || image_type == AmdGpu::ImageType::Color3D;
-+    case AmdGpu::ImageType::Color3D:
-+        return image_type == AmdGpu::ImageType::Color3D;
-+    default:
-+        UNREACHABLE();
-+    }
-+}
-+
-+ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept
-+    : is_storage{desc.is_written} {
-+    const auto dfmt = image.GetDataFmt();
-+    auto nfmt = image.GetNumberFmt();
-+    if (is_storage && nfmt == AmdGpu::NumberFormat::Srgb) {
-+        nfmt = AmdGpu::NumberFormat::Unorm;
-+    }
-+    format = Vulkan::LiverpoolToVK::SurfaceFormat(dfmt, nfmt);
-+    if (desc.is_depth) {
-+        format = Vulkan::LiverpoolToVK::PromoteFormatToDepth(format);
-+    }
-+
 +    range.base.level = std::min<u32>(image.base_level, image.NumLevels() - 1);
 +    range.base.layer = std::min<u32>(image.base_array, image.NumLayers() - 1);
-+    range.extent.levels = image.NumViewLevels(desc.is_array);
-+    range.extent.layers = image.NumViewLayers(desc.is_array);
+     range.extent.levels = image.NumViewLevels(desc.is_array);
+     range.extent.layers = image.NumViewLayers(desc.is_array);
+-    type = desc.GetHostViewType(image);
+-
 +    type = image.GetViewType(desc.is_array);
 +    min_lod = static_cast<u32>(image.min_lod);
-+    if (!is_storage) {
+     if (!is_storage) {
+-        mapping = Vulkan::LiverpoolToVK::ComponentMapping(image.DstSelect());
 +        mapping = image.DstSelect();
-+    }
-+}
-+
-+ImageViewInfo::ImageViewInfo(const AmdGpu::ColorBuffer& col_buffer) noexcept {
-+    range.base.layer = col_buffer.BaseSlice();
-+    range.extent.layers = col_buffer.NumSlices() - range.base.layer;
-+    type = range.extent.layers > 1 ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
-+    format =
-+        Vulkan::LiverpoolToVK::SurfaceFormat(col_buffer.GetDataFmt(), col_buffer.GetNumberFmt());
-+}
-+
-+ImageViewInfo::ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::DepthView view,
-+                             AmdGpu::DepthControl ctl) {
-+    format = Vulkan::LiverpoolToVK::DepthFormat(depth_buffer.z_info.format,
-+                                                depth_buffer.stencil_info.format);
-+    is_storage = ctl.depth_write_enable;
-+    range.base.layer = view.slice_start;
-+    range.extent.layers = view.NumSlices() - range.base.layer;
-+    type = range.extent.layers > 1 ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
-+}
-+
-+ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info_,
-+                     const Image& image)
-+    : info{info_} {
-+    vk::ImageViewUsageCreateInfo usage_ci{.usage = image.usage_flags};
-+    if (!info.is_storage) {
-+        usage_ci.usage &= ~vk::ImageUsageFlagBits::eStorage;
-+    }
+     }
+ }
+ 
+@@ -78,6 +84,13 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
+     if (!info.is_storage) {
+         usage_ci.usage &= ~vk::ImageUsageFlagBits::eStorage;
+     }
 +    vk::ImageViewMinLodCreateInfoEXT min_lod_ci{};
 +    if (info.min_lod != 0 && instance.IsImageViewMinLodSupported()) {
 +        const float last_level =
@@ -434603,62 +431532,27 @@ index 28f6e17e..0d076772 100644
 +        min_lod_ci.minLod = std::min(static_cast<float>(info.min_lod) / 256.f, last_level);
 +        usage_ci.pNext = &min_lod_ci;
 +    }
-+    // When sampling D32/D16 texture from shader, the T# specifies R32/R16 format so adjust it.
-+    vk::Format format = info.format;
-+    vk::ImageAspectFlags aspect = image.aspect_mask;
-+    if (image.aspect_mask & vk::ImageAspectFlagBits::eDepth &&
-+        Vulkan::LiverpoolToVK::IsFormatDepthCompatible(format)) {
-+        format = image.info.pixel_format;
-+        aspect = vk::ImageAspectFlagBits::eDepth;
-+    }
-+    if (image.aspect_mask & vk::ImageAspectFlagBits::eStencil &&
-+        Vulkan::LiverpoolToVK::IsFormatStencilCompatible(format)) {
-+        format = image.info.pixel_format;
-+        aspect = vk::ImageAspectFlagBits::eStencil;
-+    }
-+
+     // When sampling D32/D16 texture from shader, the T# specifies R32/R16 format so adjust it.
+     vk::Format format = info.format;
+     vk::ImageAspectFlags aspect = image.aspect_mask;
+@@ -92,12 +105,16 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
+         aspect = vk::ImageAspectFlagBits::eStencil;
+     }
+ 
 +    const auto components = info.mapping == AmdGpu::IdentityMapping
 +                                ? vk::ComponentMapping{}
 +                                : Vulkan::LiverpoolToVK::ComponentMapping(info.mapping);
 +
-+    const vk::ImageViewCreateInfo image_view_ci = {
-+        .pNext = &usage_ci,
-+        .image = image.GetImage(),
-+        .viewType = ConvertImageViewType(info.type),
-+        .format = instance.GetSupportedFormat(format, image.format_features),
+     const vk::ImageViewCreateInfo image_view_ci = {
+         .pNext = &usage_ci,
+         .image = image.GetImage(),
+         .viewType = ConvertImageViewType(info.type),
+         .format = instance.GetSupportedFormat(format, image.format_features),
+-        .components = info.mapping,
 +        .components = components,
-+        .subresourceRange{
-+            .aspectMask = aspect,
-+            .baseMipLevel = info.range.base.level,
-+            .levelCount = info.range.extent.levels,
-+            .baseArrayLayer = info.range.base.layer,
-+            .layerCount = info.range.extent.layers,
-+        },
-+    };
-+    if (!IsViewTypeCompatible(info.type, image.info.type)) {
-+        LOG_ERROR(Render_Vulkan, "image view type {} is incompatible with image type {}",
-+                  magic_enum::enum_name(info.type), magic_enum::enum_name(image.info.type));
-+    }
-+
-+    auto [view_result, view] = instance.GetDevice().createImageViewUnique(image_view_ci);
-+    ASSERT_MSG(view_result == vk::Result::eSuccess, "Failed to create image view: {}",
-+               vk::to_string(view_result));
-+    image_view = std::move(view);
-+
-+    const auto view_aspect = aspect & vk::ImageAspectFlagBits::eDepth     ? "Depth"
-+                             : aspect & vk::ImageAspectFlagBits::eStencil ? "Stencil"
-+                                                                          : "Color";
-+    Vulkan::SetObjectName(
-+        instance.GetDevice(), *image_view, "ImageView {}x{}x{} {:#x}:{:#x} {}:{} {}:{} ({})",
-+        image.info.size.width, image.info.size.height, image.info.size.depth,
-+        image.info.guest_address, image.info.guest_size, info.range.base.level,
-+        info.range.base.level + info.range.extent.levels - 1, info.range.base.layer,
-+        info.range.base.layer + info.range.extent.layers - 1, view_aspect);
-+}
-+
-+ImageView::~ImageView() = default;
-+
-+} // namespace VideoCore
+         .subresourceRange{
+             .aspectMask = aspect,
+             .baseMipLevel = info.range.base.level,
 diff --git a/src/video_core/texture_cache/image_view.h b/src/video_core/texture_cache/image_view.h
 index 4d07aaa7..488b971c 100644
 --- a/src/video_core/texture_cache/image_view.h
