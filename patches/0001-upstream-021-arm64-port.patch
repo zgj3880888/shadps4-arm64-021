@@ -371536,7 +371536,7 @@ index 00000000..17be2c0c
 +
 +} // namespace Shader::Optimization
 diff --git a/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp b/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
-index 9b2b50f8..4e985bc8 100644
+index 9b2b50f8..f08938b6 100644
 --- a/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
 +++ b/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
 @@ -10,6 +10,7 @@
@@ -371555,27 +371555,7 @@ index 9b2b50f8..4e985bc8 100644
  #include "shader_recompiler/ir/opcodes.h"
  #include "shader_recompiler/ir/passes/srt.h"
  #include "shader_recompiler/ir/program.h"
-@@ -35,6 +37,19 @@
- #include <unistd.h>
- #endif
- 
-+namespace {
-+
-+// 0.21.1 dropped IR::Value::InstRecursive() together with the Identity opcode it used to walk,
-+// so there is no longer an identity chain to skip and Inst() is the whole conversion. Kept as a
-+// named helper because both the x86 and the aarch64 SRT walker call it and the intent should
-+// survive the next upstream reshuffle.
-+// Qualified: this sits above the per-architecture blocks, outside namespace Shader.
-+Shader::IR::Inst* InstRecursive(Shader::IR::Value value) {
-+    return value.TryInst();
-+}
-+
-+} // namespace
-+
- #ifdef ARCH_X86_64
- 
- using namespace Xbyak::util;
-@@ -62,7 +77,7 @@ static void DumpSrtProgram(const Shader::Info& info, const u8* code, size_t code
+@@ -62,7 +64,7 @@ static void DumpSrtProgram(const Shader::Info& info, const u8* code, size_t code
      if (!std::filesystem::exists(dump_dir)) {
          std::filesystem::create_directories(dump_dir);
      }
@@ -371584,7 +371564,7 @@ index 9b2b50f8..4e985bc8 100644
      const auto file = IOFile{dump_dir / filename, FileAccessMode::Create, FileType::TextFile};
  
      u64 address = reinterpret_cast<u64>(code);
-@@ -126,7 +141,8 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
+@@ -126,7 +128,8 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
      // Fill nops
      memset(code_patch + patch_size, 0x90, len - patch_size);
  
@@ -371594,7 +371574,7 @@ index 9b2b50f8..4e985bc8 100644
  
      return true;
  }
-@@ -134,11 +150,43 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
+@@ -134,11 +137,43 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
  using namespace Shader;
  
  struct PassInfo {
@@ -371640,7 +371620,7 @@ index 9b2b50f8..4e985bc8 100644
      std::unordered_map<IR::Inst*, PtrUserList> pointer_uses;
      // GetUserData instructions corresponding to sgpr_base of SRT roots
      boost::container::small_flat_map<IR::ScalarReg, IR::Inst*, 1> srt_roots;
-@@ -147,7 +195,7 @@ struct PassInfo {
+@@ -147,7 +182,7 @@ struct PassInfo {
      std::unordered_map<u32, IR::Inst*> vn_to_inst;
  
      // Bumped during codegen to assign offsets to readconsts
@@ -371649,7 +371629,7 @@ index 9b2b50f8..4e985bc8 100644
  
      PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
          auto it = pointer_uses.find(inst);
-@@ -171,20 +219,411 @@ namespace Shader::Optimization {
+@@ -171,20 +206,411 @@ namespace Shader::Optimization {
  
  namespace {
  
@@ -372066,7 +372046,7 @@ index 9b2b50f8..4e985bc8 100644
      PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
      ASSERT(use_list);
  
-@@ -194,10 +633,20 @@ static void VisitPointer(u32 off_dw, IR::Inst* subtree, PassInfo& pass_info,
+@@ -194,10 +620,20 @@ static void VisitPointer(u32 off_dw, IR::Inst* subtree, PassInfo& pass_info,
      // TODO src and dst are contiguous. Optimize with wider loads/stores
      // TODO if this subtree is dynamically indexed, don't compact it (keep it sparse)
      for (auto [src_off_dw, use] : *use_list) {
@@ -372089,7 +372069,7 @@ index 9b2b50f8..4e985bc8 100644
          pass_info.dst_off_dw++;
      }
  
-@@ -232,7 +681,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
+@@ -232,7 +668,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
      ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
  
      for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
@@ -372098,7 +372078,7 @@ index 9b2b50f8..4e985bc8 100644
      }
  
      c.ret();
-@@ -249,72 +698,191 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
+@@ -249,72 +685,191 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
      info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
  }
  
@@ -372210,12 +372190,12 @@ index 9b2b50f8..4e985bc8 100644
 +            }
 +
 +            SimplifyReadConstAddressAdd(inst);
++
++            all_readconsts.push_back(&inst);
  
 -                all_readconsts.push_back(&inst);
 -                if (pass_info.DeduplicateInstruction(&inst) != &inst) {
 -                    // This is a duplicate of a readconst we've already visited
-+            all_readconsts.push_back(&inst);
-+
 +            auto offset = inst.Arg(1);
 +            if (offset.IsImmediate()) {
 +                continue;
@@ -372239,13 +372219,13 @@ index 9b2b50f8..4e985bc8 100644
 +                            }
 +                        }
 +                    }
-                     continue;
-                 }
++                    continue;
++                }
 +                if (inst->GetOpcode() == IR::Opcode::GetUserData ||
 +                    inst->GetOpcode() == IR::Opcode::ReadConst ||
 +                    !IsAllowedOffsetInstruction(inst)) {
-+                    continue;
-+                }
+                     continue;
+                 }
 +                for (size_t arg = inst->NumArgs(); arg--;) {
 +                    const IR::Value arg_value = inst->Arg(arg);
 +                    if (arg_value.IsImmediate()) {
@@ -372327,7 +372307,24 @@ index 9b2b50f8..4e985bc8 100644
  }
  
  } // namespace Shader::Optimization
-@@ -607,7 +1175,7 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
+@@ -544,6 +1099,16 @@ namespace Shader::Optimization {
+ 
+ namespace {
+ 
++// 0.21.1 dropped IR::Value::InstRecursive() together with the Identity opcode it used to walk,
++// so there is no longer an identity chain to skip and Inst() is the whole conversion. Kept as a
++// named helper because both the x86 and the aarch64 SRT walker call it and the intent should
++// survive the next upstream reshuffle. This has to live inside namespace Shader: the file only
++// opens `namespace Shader` further down, so a fully-qualified Shader::IR::Inst above that point
++// names a namespace the compiler has not seen yet.
++IR::Inst* InstRecursive(IR::Value value) {
++    return value.TryInst();
++}
++
+ void VisitPointer(u32 offset_dw, IR::Inst* subtree, PassInfo& pass_info,
+                   Arm64SrtEmitter& emitter) {
+     emitter.PushPointer(offset_dw);
+@@ -607,7 +1172,7 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
                  continue;
              }
  
@@ -372336,7 +372333,7 @@ index 9b2b50f8..4e985bc8 100644
              const auto pred = [](IR::Inst* candidate) -> std::optional<IR::Inst*> {
                  if (candidate->GetOpcode() == IR::Opcode::GetUserData ||
                      candidate->GetOpcode() == IR::Opcode::ReadConst) {
-@@ -615,8 +1183,11 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
+@@ -615,8 +1180,11 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
                  }
                  return std::nullopt;
              };
