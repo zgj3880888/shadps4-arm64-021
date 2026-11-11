@@ -26523,6 +26523,100 @@ index 3a5240f1..264d7f23 100644
 +std::string_view NameOf(Class log_class);
 +
 +} // namespace Common::Log
+diff --git a/src/common/logging/formatter.h b/src/common/logging/formatter.h
+index fad8451e..abc62dcb 100644
+--- a/src/common/logging/formatter.h
++++ b/src/common/logging/formatter.h
+@@ -1,42 +1,47 @@
+-// SPDX-FileCopyrightText: Copyright 2014 Citra Emulator Project
+-// SPDX-License-Identifier: GPL-2.0-or-later
+-
+-#pragma once
+-
+-#include <type_traits>
+-#include <fmt/format.h>
+-
+-// Adapted from https://github.com/fmtlib/fmt/issues/2704
+-// a generic formatter for enum classes
+-#if FMT_VERSION >= 80100
+-template <typename T>
+-struct fmt::formatter<T, std::enable_if_t<std::is_enum_v<T>, char>>
+-    : formatter<std::underlying_type_t<T>> {
+-    template <typename FormatContext>
+-    auto format(const T& value, FormatContext& ctx) -> decltype(ctx.out()) {
+-        return fmt::formatter<std::underlying_type_t<T>>::format(
+-            static_cast<std::underlying_type_t<T>>(value), ctx);
+-    }
+-};
+-#endif
+-
+-namespace fmt {
+-template <typename T = std::string_view>
+-struct UTF {
+-    T data;
+-
+-    explicit UTF(const std::u8string_view view) {
+-        data = view.empty() ? T{} : T{(const char*)&view.front(), (const char*)&view.back() + 1};
+-    }
+-
+-    explicit UTF(const std::u8string& str) : UTF(std::u8string_view{str}) {}
+-};
+-} // namespace fmt
+-
+-template <>
+-struct fmt::formatter<fmt::UTF<std::string_view>, char> : formatter<std::string_view> {
+-    template <typename FormatContext>
+-    auto format(const UTF<std::string_view>& wrapper, FormatContext& ctx) const {
+-        return formatter<std::string_view>::format(wrapper.data, ctx);
+-    }
++// SPDX-FileCopyrightText: Copyright 2014 Citra Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <type_traits>
++#include <fmt/format.h>
++
++// Adapted from https://github.com/fmtlib/fmt/issues/2704
++// a generic formatter for enum classes
++#if FMT_VERSION >= 80100
++template <typename T>
++struct fmt::formatter<T, std::enable_if_t<std::is_enum_v<T>, char>>
++    : formatter<std::underlying_type_t<T>> {
++    template <typename FormatContext>
++    auto format(const T& value, FormatContext& ctx) -> decltype(ctx.out()) {
++        return fmt::formatter<std::underlying_type_t<T>>::format(
++            static_cast<std::underlying_type_t<T>>(value), ctx);
++    }
++};
++#endif
++
++namespace fmt {
++template <typename T = std::string_view>
++struct UTF {
++    T data;
++
++    explicit UTF(const std::u8string_view view) {
++        data = view.empty() ? T{} : T{(const char*)&view.front(), (const char*)&view.back() + 1};
++    }
++
++    explicit UTF(const std::u8string& str) : UTF(std::u8string_view{str}) {}
++};
++} // namespace fmt
++
++template <>
++struct fmt::formatter<fmt::UTF<std::string_view>, char> {
++    template <typename FormatContext>
++    auto format(const UTF<std::string_view>& wrapper, FormatContext& ctx) const
++        -> decltype(ctx.out()) {
++        // fmt 12 turned formatter<basic_string_view> into a generic native_formatter whose
++        // format() is a member template, so the inherited name is not found without extra
++        // `template`/`this->` plumbing. Formatting through format_to sidesteps the base class
++        // entirely and produces the same output.
++        return fmt::format_to(ctx.out(), "{}", wrapper.data);
++    }
+ };
+\ No newline at end of file
 diff --git a/src/common/logging/log.cpp b/src/common/logging/log.cpp
 index a50090f5..d5276147 100644
 --- a/src/common/logging/log.cpp
@@ -29320,10 +29414,10 @@ index a8152e95..7df0a01d 100644
 +
 +} // namespace Serialization
 diff --git a/src/common/signal_context.cpp b/src/common/signal_context.cpp
-index df93150e..2cf39385 100644
+index df93150e..1e1e7da4 100644
 --- a/src/common/signal_context.cpp
 +++ b/src/common/signal_context.cpp
-@@ -1,97 +1,111 @@
+@@ -1,97 +1,138 @@
 -// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 -// SPDX-License-Identifier: GPL-2.0-or-later
 -
@@ -29441,6 +29535,38 @@ index df93150e..2cf39385 100644
 +
 +namespace Common {
 +
++#if defined(__linux__) && defined(ARCH_ARM64)
++// Linux/aarch64 reports fault details out of band: the ucontext carries a chain of
++// _aarch64_ctx records in uc_mcontext.__reserved, and the ESR lives in the record whose
++// magic is ESR_MAGIC. There is no fixed offset, so the chain has to be walked -- and it is
++// guest-supplied only in the sense of trust, so every size is validated before use.
++static bool GetLinuxArm64Esr(const void* ctx, u32* esr) {
++    const auto* context = static_cast<const ucontext_t*>(ctx);
++    const auto* record = context->uc_mcontext.__reserved;
++    const auto* const end = record + sizeof(context->uc_mcontext.__reserved);
++    while (static_cast<size_t>(end - record) >= sizeof(_aarch64_ctx)) {
++        const auto* header = reinterpret_cast<const _aarch64_ctx*>(record);
++        if (header->magic == 0 && header->size == 0) {
++            break;
++        }
++        const size_t remaining = static_cast<size_t>(end - record);
++        if (header->size < sizeof(*header) || header->size > remaining ||
++            (header->size % alignof(_aarch64_ctx)) != 0) {
++            return false;
++        }
++        if (header->magic == ESR_MAGIC) {
++            if (header->size < sizeof(esr_context)) {
++                return false;
++            }
++            *esr = reinterpret_cast<const esr_context*>(record)->esr;
++            return true;
++        }
++        record += header->size;
++    }
++    return false;
++}
++#endif
++
 +void* GetRip(void* ctx) {
 +#if defined(_WIN32)
 +    return (void*)((EXCEPTION_POINTERS*)ctx)->ContextRecord->Rip;
@@ -29489,29 +29615,11 @@ index df93150e..2cf39385 100644
 +#elif defined(ARCH_X86_64)
 +    return ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_ERR] & 0x2;
 +#elif defined(__linux__) && defined(ARCH_ARM64)
-+    const auto* context = static_cast<const ucontext_t*>(ctx);
-+    const auto* record = context->uc_mcontext.__reserved;
-+    const auto* const end = record + sizeof(context->uc_mcontext.__reserved);
-+    while (static_cast<size_t>(end - record) >= sizeof(_aarch64_ctx)) {
-+        const auto* header = reinterpret_cast<const _aarch64_ctx*>(record);
-+        if (header->magic == 0 && header->size == 0) {
-+            break;
-+        }
-+        const size_t remaining = end - record;
-+        if (header->size < sizeof(*header) || header->size > remaining ||
-+            (header->size % alignof(_aarch64_ctx)) != 0) {
-+            return false;
-+        }
-+        if (header->magic == ESR_MAGIC) {
-+            if (header->size < sizeof(esr_context)) {
-+                return false;
-+            }
-+            const auto* esr = reinterpret_cast<const esr_context*>(record);
-+            return esr->esr & 0x40;
-+        }
-+        record += header->size;
++    u32 esr = 0;
++    if (!GetLinuxArm64Esr(ctx, &esr)) {
++        return false;
 +    }
-+    return false;
++    return (esr & 0x40) != 0;
 +#else
 +#error "Unsupported architecture"
 +#endif
@@ -29522,10 +29630,23 @@ index df93150e..2cf39385 100644
 +    return ((EXCEPTION_POINTERS*)ctx)->ExceptionRecord->ExceptionInformation[0] == 0xf;
 +#elif defined(__APPLE__) && defined(ARCH_X86_64)
 +    return ((ucontext_t*)ctx)->uc_mcontext->__es.__err & 0x10;
++#elif defined(__APPLE__) && defined(ARCH_ARM64)
++    return (((ucontext_t*)ctx)->uc_mcontext->__es.__esr & 0x3f) == 0x21;
 +#elif defined(__FreeBSD__) && defined(ARCH_X86_64)
 +    return ((ucontext_t*)ctx)->uc_mcontext.mc_err & 0x10;
 +#elif defined(ARCH_X86_64)
 +    return ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_ERR] & 0x10;
++#elif defined(__linux__) && defined(ARCH_ARM64)
++    // ESR.EC (bits 31:26) distinguishes why we trapped: 0x21 = instruction abort from a lower
++    // exception level, 0x0e = illegal execution state. Both mean "the PC itself faulted",
++    // which is what the guest-visible prot query asks about. Data aborts (EC 0x24/0x25) are
++    // deliberately excluded -- those are the write path, not the execute path.
++    u32 esr = 0;
++    if (!GetLinuxArm64Esr(ctx, &esr)) {
++        return false;
++    }
++    const u32 ec = (esr >> 26) & 0x3f;
++    return ec == 0x21 || ec == 0x0e;
 +#else
 +#error "Unsupported architecture"
 +#endif
@@ -31589,10 +31710,10 @@ index b71f66f2..f0e5fb82 100644
 +
 +} // namespace Core
 diff --git a/src/core/aerolib/stubs.cpp b/src/core/aerolib/stubs.cpp
-index 4e551eac..abcef8d6 100644
+index 4e551eac..c9dc70d8 100644
 --- a/src/core/aerolib/stubs.cpp
 +++ b/src/core/aerolib/stubs.cpp
-@@ -1,102 +1,74 @@
+@@ -1,102 +1,175 @@
 -// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 -// SPDX-License-Identifier: GPL-2.0-or-later
 -
@@ -31698,23 +31819,43 @@ index 4e551eac..abcef8d6 100644
 +// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cstring>
 +#include <memory>
 +#include <mutex>
 +#include <string>
++#include <utility>
 +#include <vector>
 +
-+#include <xbyak/xbyak.h>
-+
++#include "common/arch.h"
 +#include "common/logging/log.h"
 +#include "core/aerolib/aerolib.h"
 +#include "core/aerolib/stubs.h"
 +
++#if defined(ARCH_X86_64)
++#include <xbyak/xbyak.h>
++#else
++#include "core/libraries/kernel/file_system.h"
++#endif
++
 +namespace Core::AeroLib {
 +
-+// Helper to provide stub implementations for missing functions
++// Helper to provide stub implementations for missing functions.
 +//
-+// This works by constructing a minimal trampoline for each new stub which then jumps to a common
-+// handler with its index provided as a parameter so nid info can be found
++// Two strategies live here, and which one is compiled in is decided by the host architecture:
++//
++//  * x86_64 hosts (the upstream default) build a tiny Xbyak trampoline per stub that loads its
++//    own index into rdi and jumps to one shared handler. One shared C++ body, N generated
++//    thunks -- cheap, and the guest calling convention matches the host calling convention.
++//
++//  * aarch64 hosts cannot do that: the guest ABI is x86-64 SysV while the host is AAPCS64, so a
++//    hand-built x86 thunk would never be reachable. Instead we instantiate MAX_STUBS distinct
++//    do-nothing functions at compile time and hand out their addresses. Each template
++//    instantiation carries its own constant index, so no argument marshalling is needed.
++
++#if defined(ARCH_X86_64)
 +
 +struct StubEntry {
 +    const NidEntry* nid = nullptr;
@@ -31767,6 +31908,87 @@ index 4e551eac..abcef8d6 100644
 +    g_stub_entries.push_back(std::move(e));
 +    return reinterpret_cast<u64>(g_stub_entries.back().code->getCode());
 +}
++
++#else // !ARCH_X86_64
++
++// Bloodborne's eboot plus late-loaded libc exceeds 8192 imports. Keep enough named slots for the
++// libc/FIOS boundary so missing imports remain diagnosable and can be routed to HLE functions.
++constexpr u32 MAX_STUBS = 12288;
++
++static u64 UnknownStub(u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5) {
++    static std::atomic<u32> traces{};
++    if (traces.fetch_add(1, std::memory_order_relaxed) < 256) {
++        LOG_ERROR(Core,
++                  "UnknownStub caller={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}; returning zero",
++                  __builtin_return_address(0), arg0, arg1, arg2, arg3, arg4, arg5);
++    }
++    return 0;
++}
++
++static const NidEntry* stub_nids[MAX_STUBS];
++static std::string stub_nids_unknown[MAX_STUBS];
++
++static u64 CommonStub(int stub_index, void* addr) {
++    auto entry = stub_nids[stub_index];
++    if (entry) {
++        LOG_ERROR(Core, "Stub: {} (nid: {}) called, returning zero to {}", entry->name, entry->nid,
++                  addr);
++    } else {
++        LOG_ERROR(Core, "Stub: Unknown (nid: {}) called, returning zero to {}",
++                  stub_nids_unknown[stub_index], addr);
++    }
++    return 0;
++}
++
++template <int stub_index>
++static u64 CommonStubTemplate() {
++    return CommonStub(stub_index, __builtin_return_address(0));
++}
++
++template <size_t... Is>
++consteval auto MakeStubArray(std::index_sequence<Is...>) {
++    return std::array<u64 (*)(), sizeof...(Is)>{&CommonStubTemplate<Is>...};
++}
++
++constexpr auto stub_handlers = MakeStubArray(std::make_index_sequence<MAX_STUBS>{});
++static std::atomic<u32> UsedStubEntries;
++
++u64 GetStub(const char* nid) {
++    // These heavily used file APIs occur after the named-stub capacity in the generated aerolib
++    // table. LLE modules such as Bloodborne's libc still import them late, so preserve their HLE
++    // implementations instead of collapsing them to UnknownStub.
++    if (std::strcmp(nid, "AqBioC2vF3I") == 0) {
++        return reinterpret_cast<u64>(&Libraries::Kernel::posix_read);
++    }
++    if (std::strcmp(nid, "Cg4srZ6TKbU") == 0) {
++        return reinterpret_cast<u64>(&Libraries::Kernel::sceKernelRead);
++    }
++    if (std::strcmp(nid, "Oy6IpwgtYOk") == 0) {
++        return reinterpret_cast<u64>(&Libraries::Kernel::posix_lseek);
++    }
++    if (std::strcmp(nid, "oib76F-12fk") == 0) {
++        return reinterpret_cast<u64>(&Libraries::Kernel::sceKernelLseek);
++    }
++    if (std::strcmp(nid, "kBwCPsYX-m4") == 0) {
++        return reinterpret_cast<u64>(&Libraries::Kernel::sceKernelFstat);
++    }
++
++    const u32 slot = UsedStubEntries.fetch_add(1, std::memory_order_relaxed);
++    if (slot >= MAX_STUBS) {
++        return reinterpret_cast<u64>(&UnknownStub);
++    }
++
++    const auto entry = FindByNid(nid);
++    if (!entry) {
++        stub_nids_unknown[slot] = nid;
++    } else {
++        stub_nids[slot] = entry;
++    }
++
++    return reinterpret_cast<u64>(stub_handlers[slot]);
++}
++
++#endif
 +
 +} // namespace Core::AeroLib
 diff --git a/src/core/aerolib/stubs.h b/src/core/aerolib/stubs.h
@@ -118340,10 +118562,10 @@ index 00000000..3518f809
 +
 +} // namespace Libraries::GameCustomDataDialog
 diff --git a/src/core/libraries/gnmdriver/gnmdriver.cpp b/src/core/libraries/gnmdriver/gnmdriver.cpp
-index 798c0ad2..c30c474c 100644
+index 798c0ad2..dc0381a0 100644
 --- a/src/core/libraries/gnmdriver/gnmdriver.cpp
 +++ b/src/core/libraries/gnmdriver/gnmdriver.cpp
-@@ -1,3261 +1,3414 @@
+@@ -1,3261 +1,3420 @@
 -// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 -// SPDX-License-Identifier: GPL-2.0-or-later
 -
@@ -122940,6 +123162,11 @@ index 798c0ad2..c30c474c 100644
 +    return ORBIS_GNM_ERROR_FAILURE;
 +}
 +
++// Bachata delivers the flip interrupt through Platform::IrqC, which keys the one-shot handler by a
++// caller-supplied token. Each 0.21.1 flip goes through one of these so the registration can be
++// resolved when the GPU actually completes the flip.
++static std::atomic_uint32_t next_flip_token{1};
++
 +static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf_idx, u32 flip_mode,
 +                                   s64 flip_arg, void* unk) {
 +    // check for `prepareFlip` packet
@@ -122953,8 +123180,9 @@ index 798c0ad2..c30c474c 100644
 +               "Invalid flip packet");
 +    ASSERT_MSG(buf_idx != 0xffff'ffffu, "Invalid VO buffer index");
 +
++    const u32 flip_token = next_flip_token.fetch_add(1, std::memory_order_relaxed);
 +    const s32 flip_result = VideoOut::sceVideoOutSubmitEopFlip(vo_handle, buf_idx, flip_mode,
-+                                                               flip_arg, nullptr /*unk*/);
++                                                              flip_arg, nullptr /*unk*/, flip_token);
 +    if (flip_result != 0) {
 +        if (flip_result == 0x80290012) {
 +            LOG_ERROR(Lib_GnmDriver, "Flip queue is full");
@@ -152289,10 +152517,10 @@ index 4ad15aee..90f34b9e 100644
  #ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
      (void)Core::GuestCpu::PublishHostRange(*ef, sizeof(EventFlagInternal), true);
 diff --git a/src/core/libraries/kernel/threads/exception.cpp b/src/core/libraries/kernel/threads/exception.cpp
-index 46b4d81c..1c1a1aa9 100644
+index 46b4d81c..779acafd 100644
 --- a/src/core/libraries/kernel/threads/exception.cpp
 +++ b/src/core/libraries/kernel/threads/exception.cpp
-@@ -1,659 +1,716 @@
+@@ -1,659 +1,730 @@
 -// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 -// SPDX-License-Identifier: GPL-2.0-or-later
 -
@@ -153001,6 +153229,14 @@ index 46b4d81c..1c1a1aa9 100644
 +        return;
 +    }
 +    s_current_host_context = raw_context;
++#ifdef ARCH_ARM64
++    // The guest is x86 but the host is aarch64, so there is no register-for-register mapping
++    // to perform here: guests signals are handed to FEX (see Core::Fex::DeliverGuestOrbisSignal)
++    // which owns the x86 register file. Keep this object inert rather than inventing a
++    // translation; anything reading uc_mcontext on arm64 would be reading garbage either way.
++    uc_mcontext.mc_addr = reinterpret_cast<u64>(inf->si_addr);
++    return;
++#endif
 +#ifdef ARCH_X86_64
 +#ifdef __APPLE__
 +    const auto& regs = raw_context->uc_mcontext->__ss;
@@ -153069,6 +153305,8 @@ index 46b4d81c..1c1a1aa9 100644
 +    uc_mcontext.mc_rip = regs[REG_RIP];
 +    uc_mcontext.mc_addr = reinterpret_cast<uint64_t>(inf->si_addr);
 +#endif
++#elif defined(ARCH_ARM64)
++    // Handled above, before the ARCH_X86_64 block.
 +#else
 +#error "ucontext_t conversion not implemented for current architecture."
 +#endif
@@ -153192,6 +153430,10 @@ index 46b4d81c..1c1a1aa9 100644
 +    // regs[REG_CSGSFS] |= (greg_t{uc_mcontext.mc_gs} << 16);
 +    regs[REG_RIP] = uc_mcontext.mc_rip;
 +#endif
++#elif defined(ARCH_ARM64)
++    // Nothing to sync back: on arm64 the guest register file lives inside FEX and this
++    // Ucontext never owned a copy of it. s_current_host_context is still cleared by the
++    // caller, so returning without writing is the correct no-op.
 +#else
 +#error "ucontext_t conversion not implemented for current architecture."
 +#endif
@@ -284314,930 +284556,28 @@ index b5f72e9c..a615a3d2 100644
 +
 +} // namespace Libraries::Videodec
 diff --git a/src/core/libraries/videoout/driver.cpp b/src/core/libraries/videoout/driver.cpp
-index df6df103..8d8d988a 100644
+index df6df103..26d256e3 100644
 --- a/src/core/libraries/videoout/driver.cpp
 +++ b/src/core/libraries/videoout/driver.cpp
-@@ -1,507 +1,413 @@
--// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
--// SPDX-License-Identifier: GPL-2.0-or-later
--
--#include <atomic>
--#include <optional>
--
--#include "common/assert.h"
--#include "common/debug.h"
--#include "common/thread.h"
--#include "platform/bachata/runtime_client.h"
--#include "core/debug_state.h"
--#include "core/emulator_settings.h"
--#include "core/libraries/kernel/time.h"
--#include "core/libraries/videoout/driver.h"
--#include "core/libraries/videoout/videoout_error.h"
--#include "imgui/renderer/imgui_core.h"
--#include "video_core/amdgpu/liverpool.h"
--#include "video_core/renderer_vulkan/vk_presenter.h"
--
--extern std::unique_ptr<Vulkan::Presenter> presenter;
--extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
--
--namespace Libraries::VideoOut {
--
--static std::atomic_uint32_t submit_traces{};
--static std::atomic_uint32_t dispatch_traces{};
--static std::atomic_uint32_t internal_traces{};
--static std::atomic_uint32_t queue_traces{};
--static std::atomic_uint32_t dequeue_traces{};
--static std::atomic_uint32_t present_traces{};
--
--constexpr static bool Is32BppPixelFormat(PixelFormat format) {
--    switch (format) {
--    case PixelFormat::A8R8G8B8Srgb:
--    case PixelFormat::A8B8G8R8Srgb:
--    case PixelFormat::A2R10G10B10:
--    case PixelFormat::A2R10G10B10Srgb:
--    case PixelFormat::A2R10G10B10Bt2020Pq:
--        return true;
--    default:
--        return false;
--    }
--}
--
--constexpr u32 PixelFormatBpp(PixelFormat pixel_format) {
--    switch (pixel_format) {
--    case PixelFormat::A16R16G16B16Float:
--        return 8;
--    default:
--        return 4;
--    }
--}
--
--VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
--    main_port.resolution.full_width = width;
--    main_port.resolution.full_height = height;
--    main_port.resolution.pane_width = width;
--    main_port.resolution.pane_height = height;
--    present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
--}
--
--VideoOutDriver::~VideoOutDriver() = default;
--
--int VideoOutDriver::Open(const ServiceThreadParams* params) {
--    if (main_port.is_open) {
--        return ORBIS_VIDEO_OUT_ERROR_RESOURCE_BUSY;
--    }
--    main_port.is_open = true;
--    liverpool->SetVoPort(&main_port);
--    return 1;
--}
--
--void VideoOutDriver::Close(s32 handle) {
--    std::scoped_lock lock{mutex};
--
--    // Mark as closed
--    main_port.is_open = false;
--    main_port.flip_rate = 0;
--    main_port.prev_index = -1;
--    main_port.flip_labels.ResetAll();
--
--    // Clear port information
--    std::memset(main_port.buffer_labels.data(), 0, sizeof(main_port.buffer_labels));
--    std::memset(main_port.groups.data(), 0, sizeof(main_port.groups));
--    std::memset(&main_port.vblank_status, 0, sizeof(main_port.vblank_status));
--    main_port.flip_status = FlipStatus{};
--
--    // Re-initialize buffers
--    std::memset(main_port.buffer_slots.data(), 0, sizeof(main_port.buffer_slots));
--    for (auto& buffer : main_port.buffer_slots) {
--        buffer.group_index = -1;
--    }
--
--    // Clear events
--    for (auto event : main_port.flip_events) {
--        auto equeue = Kernel::GetEqueue(event);
--        if (equeue != nullptr) {
--            equeue->RemoveEvent(static_cast<u64>(OrbisVideoOutInternalEventId::Flip),
--                                Kernel::OrbisKernelEvent::Filter::VideoOut);
--        }
--    }
--    main_port.flip_events.clear();
--    for (auto event : main_port.vblank_events) {
--        auto equeue = Kernel::GetEqueue(event);
--        if (equeue != nullptr) {
--            equeue->RemoveEvent(static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
--                                Kernel::OrbisKernelEvent::Filter::VideoOut);
--        }
--    }
--    main_port.vblank_events.clear();
--}
--
--VideoOutPort* VideoOutDriver::GetPort(int handle) {
--    if (handle != 1) [[unlikely]] {
--        return nullptr;
--    }
--    return &main_port;
--}
--
--int VideoOutDriver::RegisterBuffers(VideoOutPort* port, s32 startIndex, void* const* addresses,
--                                    s32 bufferNum, const BufferAttribute* attribute) {
--    const s32 group_index = port->FindFreeGroup();
--    if (group_index >= MaxDisplayBufferGroups) {
--        return ORBIS_VIDEO_OUT_ERROR_NO_EMPTY_SLOT;
--    }
--
--    if (startIndex + bufferNum > MaxDisplayBuffers || startIndex > MaxDisplayBuffers ||
--        bufferNum > MaxDisplayBuffers) {
--        LOG_ERROR(Lib_VideoOut,
--                  "Attempted to register too many buffers startIndex = {}, bufferNum = {}",
--                  startIndex, bufferNum);
--        return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
--    }
--
--    const s32 end_index = startIndex + bufferNum;
--    if (bufferNum > 0 &&
--        std::any_of(port->buffer_slots.begin() + startIndex, port->buffer_slots.begin() + end_index,
--                    [](auto& buffer) { return buffer.group_index != -1; })) {
--        return ORBIS_VIDEO_OUT_ERROR_SLOT_OCCUPIED;
--    }
--
--    if (attribute->reserved0 != 0 || attribute->reserved1 != 0) {
--        LOG_ERROR(Lib_VideoOut, "Invalid reserved members");
--        return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
--    }
--    if (attribute->aspect_ratio != 0) {
--        LOG_ERROR(Lib_VideoOut, "Invalid aspect ratio = {}", attribute->aspect_ratio);
--        return ORBIS_VIDEO_OUT_ERROR_INVALID_ASPECT_RATIO;
--    }
--    if (attribute->width > attribute->pitch_in_pixel) {
--        LOG_ERROR(Lib_VideoOut, "Buffer width {} is larger than pitch {}", attribute->width,
--                  attribute->pitch_in_pixel);
--        return ORBIS_VIDEO_OUT_ERROR_INVALID_PITCH;
--    }
--    if (attribute->tiling_mode < TilingMode::Tile || attribute->tiling_mode > TilingMode::Linear) {
--        LOG_ERROR(Lib_VideoOut, "Invalid tilingMode = {}",
--                  static_cast<u32>(attribute->tiling_mode));
--        return ORBIS_VIDEO_OUT_ERROR_INVALID_TILING_MODE;
--    }
--
--    LOG_INFO(Lib_VideoOut,
--             "startIndex = {}, bufferNum = {}, pixelFormat = {}, aspectRatio = {}, "
--             "tilingMode = {}, width = {}, height = {}, pitchInPixel = {}, option = {:#x}",
--             startIndex, bufferNum, GetPixelFormatString(attribute->pixel_format),
--             attribute->aspect_ratio, static_cast<u32>(attribute->tiling_mode), attribute->width,
--             attribute->height, attribute->pitch_in_pixel, attribute->option);
--
--    auto& group = port->groups[group_index];
--    std::memcpy(&group.attrib, attribute, sizeof(BufferAttribute));
--    group.is_occupied = true;
--
--    for (u32 i = 0; i < bufferNum; i++) {
--        const uintptr_t address = reinterpret_cast<uintptr_t>(addresses[i]);
--        port->buffer_slots[startIndex + i] = VideoOutBuffer{
--            .group_index = group_index,
--            .address_left = address,
--            .address_right = 0,
--        };
--
--        // Reset flip label also when registering buffer
--        port->buffer_labels[startIndex + i] = 0;
--        port->flip_labels.ResetBuffer(static_cast<s32>(startIndex + i));
--        port->SignalVoLabel();
--
--        presenter->RegisterVideoOutSurface(group, address);
--        LOG_INFO(Lib_VideoOut, "buffers[{}] = {:#x}", i + startIndex, address);
--    }
--
--    return group_index;
--}
--
--int VideoOutDriver::UnregisterBuffers(VideoOutPort* port, s32 attributeIndex) {
--    if (attributeIndex >= MaxDisplayBufferGroups || !port->groups[attributeIndex].is_occupied) {
--        LOG_ERROR(Lib_VideoOut, "Invalid attribute index {}", attributeIndex);
--        return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
--    }
--
--    auto& group = port->groups[attributeIndex];
--    group.is_occupied = false;
--
--    for (s32 i = 0; i < static_cast<s32>(port->buffer_slots.size()); ++i) {
--        auto& buffer = port->buffer_slots[i];
--        if (buffer.group_index != attributeIndex) {
--            continue;
--        }
--        buffer.group_index = -1;
--        port->flip_labels.ResetBuffer(i);
--    }
--
--    return ORBIS_OK;
--}
--
--int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex,
--                                          const BufferAttribute* attribute) {
--    if (attributeIndex >= MaxDisplayBufferGroups || !port->groups[attributeIndex].is_occupied) {
--        LOG_ERROR(Lib_VideoOut, "Invalid attribute index {}", attributeIndex);
--        return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
--    }
--
--    if (attribute->reserved0 != 0 || attribute->reserved1 != 0) {
--        LOG_ERROR(Lib_VideoOut, "Invalid reserved members");
--        return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
--    }
--    if (attribute->aspect_ratio != 0) {
--        LOG_ERROR(Lib_VideoOut, "Invalid aspect ratio = {}", attribute->aspect_ratio);
--        return ORBIS_VIDEO_OUT_ERROR_INVALID_ASPECT_RATIO;
--    }
--    if (attribute->width > attribute->pitch_in_pixel) {
--        LOG_ERROR(Lib_VideoOut, "Buffer width {} is larger than pitch {}", attribute->width,
--                  attribute->pitch_in_pixel);
--        return ORBIS_VIDEO_OUT_ERROR_INVALID_PITCH;
--    }
--    if (attribute->tiling_mode < TilingMode::Tile || attribute->tiling_mode > TilingMode::Linear) {
--        LOG_ERROR(Lib_VideoOut, "Invalid tilingMode = {}",
--                  static_cast<u32>(attribute->tiling_mode));
--        return ORBIS_VIDEO_OUT_ERROR_INVALID_TILING_MODE;
--    }
--
--    LOG_INFO(Lib_VideoOut,
--             "attributeIndex = {}, pixelFormat = {}, aspectRatio = {}, "
--             "tilingMode = {}, width = {}, height = {}, pitchInPixel = {}, option = {:#x}",
--             attributeIndex, GetPixelFormatString(attribute->pixel_format), attribute->aspect_ratio,
--             static_cast<u32>(attribute->tiling_mode), attribute->width, attribute->height,
--             attribute->pitch_in_pixel, attribute->option);
--
--    std::unique_lock lock{port->port_mutex};
--    std::memcpy(&port->groups[attributeIndex].attrib, attribute, sizeof(BufferAttribute));
--    return 0;
--}
--
--void VideoOutDriver::Flip(const Request& req) {
--    if (present_traces.fetch_add(1, std::memory_order_relaxed) < 32) {
--        LOG_INFO(Lib_VideoOut,
--                 "BACHATA_FLIP_TRACE stage=present index={} arg={} eop={} frame={}", req.index,
--                 req.flip_arg, req.eop, static_cast<const void*>(req.frame));
--    }
--    // Update HDR status before presenting.
--    presenter->SetHDR(req.port->is_hdr);
--
--    // Present the frame.
--    presenter->Present(req.frame);
--    Platform::Bachata::ReportPresentedFrame();
--    if (present_traces.load(std::memory_order_relaxed) <= 32) {
--        LOG_INFO(Lib_VideoOut, "BACHATA_FLIP_TRACE stage=present_returned index={} arg={}",
--                 req.index, req.flip_arg);
--    }
--
--    // Update flip status.
--    auto* port = req.port;
--    {
--        std::unique_lock lock{port->port_mutex};
--        auto& flip_status = port->flip_status;
--        flip_status.count++;
--        flip_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
--        flip_status.tsc = Libraries::Kernel::sceKernelReadTsc();
--        flip_status.flip_arg = req.flip_arg;
--        flip_status.current_buffer = req.index;
--        if (req.eop) {
--            --flip_status.gc_queue_num;
--        }
--        --flip_status.flip_pending_num;
--    }
--
--    // Trigger flip events for the port.
--    for (auto event : port->flip_events) {
--        auto equeue = Kernel::GetEqueue(event);
--        if (equeue != nullptr) {
--            equeue->TriggerEvent(
--                static_cast<u64>(OrbisVideoOutInternalEventId::Flip),
--                Kernel::OrbisKernelEvent::Filter::VideoOut,
--                reinterpret_cast<void*>(static_cast<u64>(OrbisVideoOutInternalEventId::Flip) |
--                                        (req.flip_arg << 16)));
--        }
--    }
--
--    // Reset prev flip label
--    if (port->prev_index != -1) {
--        port->buffer_labels[port->prev_index] = 0;
--        {
--            std::scoped_lock lock{port->port_mutex};
--            port->flip_labels.CancelRetirementForIndex(port->prev_index);
--        }
--        port->SignalVoLabel();
--    }
--    // save to prev buf index
--    port->prev_index = req.index;
--    if (req.eop && req.lock_generation != FlipLabelTracker::kInvalidGeneration && req.index >= 0) {
--        std::scoped_lock lock{port->port_mutex};
--        port->flip_labels.ScheduleRetirement(req.index, req.lock_generation,
--                                             port->vblank_status.count + 1);
--    }
--}
--
--void VideoOutDriver::DrawBlankFrame() {
+@@ -312,10 +312,14 @@ void VideoOutDriver::Flip(const Request& req) {
+ }
+ 
+ void VideoOutDriver::DrawBlankFrame() {
 -    const auto empty_frame = presenter->PrepareBlankFrame(false);
 -    if (empty_frame) {
 -        presenter->Present(empty_frame);
 -    }
--}
--
--void VideoOutDriver::DrawLastFrame() {
--    const auto frame = presenter->PrepareLastFrame();
--    if (frame != nullptr) {
--        presenter->Present(frame, true);
--    }
--}
--
--bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
--                                bool is_eop /*= false*/, u64 lock_generation) {
--    if (submit_traces.fetch_add(1, std::memory_order_relaxed) < 32) {
--        LOG_INFO(Lib_VideoOut,
--                 "BACHATA_FLIP_TRACE stage=driver_submit index={} arg={} eop={} pending={}", index,
--                 flip_arg, is_eop, port->flip_status.flip_pending_num);
--    }
--    {
--        std::unique_lock lock{port->port_mutex};
--        if (index != -1 && port->flip_status.flip_pending_num > 16) {
--            LOG_ERROR(Lib_VideoOut, "Flip queue is full");
--            return false;
--        }
--
--        if (is_eop) {
--            ++port->flip_status.gc_queue_num;
--        }
--        ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
--        port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
--    }
--
--    if (!is_eop) {
--        // Non EOP flips can arrive from any thread so ask GPU thread to perform them
--        liverpool->SendCommand([=, this]() {
--            if (dispatch_traces.fetch_add(1, std::memory_order_relaxed) < 32) {
--                LOG_INFO(Lib_VideoOut,
--                         "BACHATA_FLIP_TRACE stage=gpu_dispatch index={} arg={} eop={}", index,
--                         flip_arg, is_eop);
--            }
--            SubmitFlipInternal(port, index, flip_arg, is_eop, lock_generation);
--        });
--    } else {
--        SubmitFlipInternal(port, index, flip_arg, is_eop, lock_generation);
--    }
--
--    return true;
--}
--
--void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
--                                        u64 lock_generation) {
--    if (internal_traces.fetch_add(1, std::memory_order_relaxed) < 32) {
--        LOG_INFO(Lib_VideoOut,
--                 "BACHATA_FLIP_TRACE stage=prepare_enter index={} arg={} eop={}", index, flip_arg,
--                 is_eop);
--    }
--    Vulkan::Frame* frame;
--    if (index == -1) {
--        frame = presenter->PrepareBlankFrame(false);
--    } else {
--        const auto& buffer = port->buffer_slots[index];
--        ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
--        const auto& group = port->groups[buffer.group_index];
--        frame = presenter->PrepareFrame(group, buffer.address_left);
--    }
--    if (!frame) {
--        // GpuComm was inside a graphics task; waiting on the present fence
--        // would stall PM4. Retry after the current task yields.
--        liverpool->EnqueueCommand([=, this] {
--            SubmitFlipInternal(port, index, flip_arg, is_eop, lock_generation);
--        });
--        return;
--    }
--
--    if (queue_traces.fetch_add(1, std::memory_order_relaxed) < 32) {
--        LOG_INFO(Lib_VideoOut,
--                 "BACHATA_FLIP_TRACE stage=prepare_done index={} arg={} frame={}", index, flip_arg,
--                 static_cast<const void*>(frame));
--    }
--
--    std::scoped_lock lock{mutex};
--    requests.push({
--        .frame = frame,
--        .port = port,
--        .flip_arg = flip_arg,
--        .index = index,
--        .eop = is_eop,
--        .lock_generation = lock_generation,
--    });
--    if (queue_traces.load(std::memory_order_relaxed) <= 32) {
--        LOG_INFO(Lib_VideoOut,
--                 "BACHATA_FLIP_TRACE stage=queue_insert index={} arg={} depth={}", index, flip_arg,
--                 requests.size());
--    }
--}
--
--void VideoOutDriver::PresentThread(std::stop_token token) {
--    const std::chrono::nanoseconds vblank_period(1000000000 /
--                                                 EmulatorSettings.GetVblankFrequency());
--
--    Common::SetCurrentThreadName("shadPS4:PresentThread");
--    Common::SetCurrentThreadRealtime(vblank_period);
--
--    Common::AccurateTimer timer{vblank_period};
--
--    const auto receive_request = [this] -> Request {
--        std::scoped_lock lk{mutex};
--        if (!requests.empty()) {
--            const auto request = requests.front();
--            requests.pop();
--            return request;
--        }
--        return {};
--    };
--
--    while (!token.stop_requested()) {
--        timer.Start();
--
--        if (DebugState.IsGuestThreadsPaused()) {
--            DrawLastFrame();
--            timer.End();
--            continue;
--        }
--
--        // Check if it's time to take a request.
--        auto& vblank_status = main_port.vblank_status;
--        ApplyDueLabelRetirement();
--        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
--            const auto request = receive_request();
--            if (!request) {
--                if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
--                    if (!main_port.is_open) {
--                        DrawBlankFrame();
--                    } else if (ImGui::Core::MustKeepDrawing()) {
--                        DrawLastFrame();
--                    }
--                }
--            } else {
--                if (dequeue_traces.fetch_add(1, std::memory_order_relaxed) < 32) {
--                    LOG_INFO(Lib_VideoOut,
--                             "BACHATA_FLIP_TRACE stage=queue_dequeue index={} arg={}", request.index,
--                             request.flip_arg);
--                }
--                Flip(request);
--                FRAME_END;
--            }
--        }
--
--        {
--            // Needs lock here as can be concurrently read by `sceVideoOutGetVblankStatus`
--            std::scoped_lock lock{main_port.vo_mutex};
--
--            // Trigger flip events for the port
--            for (auto event : main_port.vblank_events) {
--                auto equeue = Kernel::GetEqueue(event);
--                if (equeue != nullptr) {
--                    equeue->TriggerEvent(
--                        static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
--                        Kernel::OrbisKernelEvent::Filter::VideoOut,
--                        reinterpret_cast<void*>(
--                            static_cast<u64>(OrbisVideoOutInternalEventId::Vblank) |
--                            (vblank_status.count << 16)));
--                }
--            }
--
--            // Update vblank status
--            vblank_status.count++;
--            vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
--            vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
--            main_port.vblank_cv.notify_all();
--        }
--
--        timer.End();
--    }
--}
--
--void VideoOutDriver::ApplyDueLabelRetirement() {
--    std::optional<s32> index;
--    {
--        std::scoped_lock lock{main_port.port_mutex};
--        index = main_port.flip_labels.ConsumeDueRetirement(main_port.vblank_status.count);
--    }
--    if (!index.has_value()) {
--        return;
--    }
--    main_port.buffer_labels[*index] = 0;
--    main_port.SignalVoLabel();
--    LOG_INFO(Lib_VideoOut, "retired scanout label index={}", *index);
--}
--
--} // namespace Libraries::VideoOut
-+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+
-+#include "common/assert.h"
-+#include "common/debug.h"
-+#include "common/thread.h"
-+#include "core/debug_state.h"
-+#include "core/emulator_settings.h"
-+#include "core/libraries/kernel/time.h"
-+#include "core/libraries/videoout/driver.h"
-+#include "core/libraries/videoout/videoout_error.h"
-+#include "imgui/renderer/imgui_core.h"
-+#include "video_core/amdgpu/liverpool.h"
-+#include "video_core/renderer_vulkan/vk_presenter.h"
-+
-+extern std::unique_ptr<Vulkan::Presenter> presenter;
-+extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
-+
-+namespace Libraries::VideoOut {
-+
-+constexpr static bool Is32BppPixelFormat(PixelFormat format) {
-+    switch (format) {
-+    case PixelFormat::A8R8G8B8Srgb:
-+    case PixelFormat::A8B8G8R8Srgb:
-+    case PixelFormat::A2R10G10B10:
-+    case PixelFormat::A2R10G10B10Srgb:
-+    case PixelFormat::A2R10G10B10Bt2020Pq:
-+        return true;
-+    default:
-+        return false;
++    // Two frames are needed: the first is recorded on the draw scheduler (so the draw commands
++    // the guest queued are retired before the blank is drawn), the second is the one the present
++    // thread actually scans out.
++    if (const auto draw_frame = presenter->PrepareBlankFrame(false)) {
++        presenter->Present(draw_frame);
 +    }
-+}
-+
-+constexpr u32 PixelFormatBpp(PixelFormat pixel_format) {
-+    switch (pixel_format) {
-+    case PixelFormat::A16R16G16B16Float:
-+        return 8;
-+    default:
-+        return 4;
-+    }
-+}
-+
-+VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
-+    main_port.resolution.full_width = width;
-+    main_port.resolution.full_height = height;
-+    main_port.resolution.pane_width = width;
-+    main_port.resolution.pane_height = height;
-+    present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
-+}
-+
-+VideoOutDriver::~VideoOutDriver() = default;
-+
-+int VideoOutDriver::Open(const ServiceThreadParams* params) {
-+    if (main_port.is_open) {
-+        return ORBIS_VIDEO_OUT_ERROR_RESOURCE_BUSY;
-+    }
-+    main_port.is_open = true;
-+    liverpool->SetVoPort(&main_port);
-+    return 1;
-+}
-+
-+void VideoOutDriver::Close(s32 handle) {
-+    std::scoped_lock lock{mutex};
-+
-+    // Mark as closed
-+    main_port.is_open = false;
-+    main_port.flip_rate = 0;
-+    main_port.prev_index = -1;
-+
-+    // Clear port information
-+    std::memset(main_port.buffer_labels.data(), 0, sizeof(main_port.buffer_labels));
-+    std::memset(main_port.groups.data(), 0, sizeof(main_port.groups));
-+    std::memset(&main_port.vblank_status, 0, sizeof(main_port.vblank_status));
-+    main_port.flip_status = FlipStatus{};
-+
-+    // Re-initialize buffers
-+    std::memset(main_port.buffer_slots.data(), 0, sizeof(main_port.buffer_slots));
-+    for (auto& buffer : main_port.buffer_slots) {
-+        buffer.group_index = -1;
-+    }
-+
-+    // Clear events
-+    for (auto event : main_port.flip_events) {
-+        auto equeue = Kernel::GetEqueue(event);
-+        if (equeue != nullptr) {
-+            equeue->RemoveEvent(static_cast<u64>(OrbisVideoOutInternalEventId::Flip),
-+                                Kernel::OrbisKernelEvent::Filter::VideoOut);
-+        }
-+    }
-+    main_port.flip_events.clear();
-+    for (auto event : main_port.vblank_events) {
-+        auto equeue = Kernel::GetEqueue(event);
-+        if (equeue != nullptr) {
-+            equeue->RemoveEvent(static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
-+                                Kernel::OrbisKernelEvent::Filter::VideoOut);
-+        }
-+    }
-+    main_port.vblank_events.clear();
-+}
-+
-+VideoOutPort* VideoOutDriver::GetPort(int handle) {
-+    if (handle != 1) [[unlikely]] {
-+        return nullptr;
-+    }
-+    return &main_port;
-+}
-+
-+int VideoOutDriver::RegisterBuffers(VideoOutPort* port, s32 startIndex, void* const* addresses,
-+                                    s32 bufferNum, const BufferAttribute* attribute) {
-+    const s32 group_index = port->FindFreeGroup();
-+    if (group_index >= MaxDisplayBufferGroups) {
-+        return ORBIS_VIDEO_OUT_ERROR_NO_EMPTY_SLOT;
-+    }
-+
-+    if (startIndex + bufferNum > MaxDisplayBuffers || startIndex > MaxDisplayBuffers ||
-+        bufferNum > MaxDisplayBuffers) {
-+        LOG_ERROR(Lib_VideoOut,
-+                  "Attempted to register too many buffers startIndex = {}, bufferNum = {}",
-+                  startIndex, bufferNum);
-+        return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
-+    }
-+
-+    const s32 end_index = startIndex + bufferNum;
-+    if (bufferNum > 0 &&
-+        std::any_of(port->buffer_slots.begin() + startIndex, port->buffer_slots.begin() + end_index,
-+                    [](auto& buffer) { return buffer.group_index != -1; })) {
-+        return ORBIS_VIDEO_OUT_ERROR_SLOT_OCCUPIED;
-+    }
-+
-+    if (attribute->reserved0 != 0 || attribute->reserved1 != 0) {
-+        LOG_ERROR(Lib_VideoOut, "Invalid reserved members");
-+        return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
-+    }
-+    if (attribute->aspect_ratio != 0) {
-+        LOG_ERROR(Lib_VideoOut, "Invalid aspect ratio = {}", attribute->aspect_ratio);
-+        return ORBIS_VIDEO_OUT_ERROR_INVALID_ASPECT_RATIO;
-+    }
-+    if (attribute->width > attribute->pitch_in_pixel) {
-+        LOG_ERROR(Lib_VideoOut, "Buffer width {} is larger than pitch {}", attribute->width,
-+                  attribute->pitch_in_pixel);
-+        return ORBIS_VIDEO_OUT_ERROR_INVALID_PITCH;
-+    }
-+    if (attribute->tiling_mode < TilingMode::Tile || attribute->tiling_mode > TilingMode::Linear) {
-+        LOG_ERROR(Lib_VideoOut, "Invalid tilingMode = {}",
-+                  static_cast<u32>(attribute->tiling_mode));
-+        return ORBIS_VIDEO_OUT_ERROR_INVALID_TILING_MODE;
-+    }
-+
-+    LOG_INFO(Lib_VideoOut,
-+             "startIndex = {}, bufferNum = {}, pixelFormat = {}, aspectRatio = {}, "
-+             "tilingMode = {}, width = {}, height = {}, pitchInPixel = {}, option = {:#x}",
-+             startIndex, bufferNum, GetPixelFormatString(attribute->pixel_format),
-+             attribute->aspect_ratio, static_cast<u32>(attribute->tiling_mode), attribute->width,
-+             attribute->height, attribute->pitch_in_pixel, attribute->option);
-+
-+    auto& group = port->groups[group_index];
-+    std::memcpy(&group.attrib, attribute, sizeof(BufferAttribute));
-+    group.is_occupied = true;
-+
-+    for (u32 i = 0; i < bufferNum; i++) {
-+        const uintptr_t address = reinterpret_cast<uintptr_t>(addresses[i]);
-+        port->buffer_slots[startIndex + i] = VideoOutBuffer{
-+            .group_index = group_index,
-+            .address_left = address,
-+            .address_right = 0,
-+        };
-+
-+        // Reset flip label also when registering buffer
-+        port->buffer_labels[startIndex + i] = 0;
-+        port->SignalVoLabel();
-+
-+        presenter->RegisterVideoOutSurface(group, address);
-+        LOG_INFO(Lib_VideoOut, "buffers[{}] = {:#x}", i + startIndex, address);
-+    }
-+
-+    return group_index;
-+}
-+
-+int VideoOutDriver::UnregisterBuffers(VideoOutPort* port, s32 attributeIndex) {
-+    if (attributeIndex >= MaxDisplayBufferGroups || !port->groups[attributeIndex].is_occupied) {
-+        LOG_ERROR(Lib_VideoOut, "Invalid attribute index {}", attributeIndex);
-+        return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
-+    }
-+
-+    auto& group = port->groups[attributeIndex];
-+    group.is_occupied = false;
-+
-+    for (auto& buffer : port->buffer_slots) {
-+        if (buffer.group_index != attributeIndex) {
-+            continue;
-+        }
-+        buffer.group_index = -1;
-+    }
-+
-+    return ORBIS_OK;
-+}
-+
-+int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex,
-+                                          const BufferAttribute* attribute) {
-+    if (attributeIndex >= MaxDisplayBufferGroups || !port->groups[attributeIndex].is_occupied) {
-+        LOG_ERROR(Lib_VideoOut, "Invalid attribute index {}", attributeIndex);
-+        return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
-+    }
-+
-+    if (attribute->reserved0 != 0 || attribute->reserved1 != 0) {
-+        LOG_ERROR(Lib_VideoOut, "Invalid reserved members");
-+        return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
-+    }
-+    if (attribute->aspect_ratio != 0) {
-+        LOG_ERROR(Lib_VideoOut, "Invalid aspect ratio = {}", attribute->aspect_ratio);
-+        return ORBIS_VIDEO_OUT_ERROR_INVALID_ASPECT_RATIO;
-+    }
-+    if (attribute->width > attribute->pitch_in_pixel) {
-+        LOG_ERROR(Lib_VideoOut, "Buffer width {} is larger than pitch {}", attribute->width,
-+                  attribute->pitch_in_pixel);
-+        return ORBIS_VIDEO_OUT_ERROR_INVALID_PITCH;
-+    }
-+    if (attribute->tiling_mode < TilingMode::Tile || attribute->tiling_mode > TilingMode::Linear) {
-+        LOG_ERROR(Lib_VideoOut, "Invalid tilingMode = {}",
-+                  static_cast<u32>(attribute->tiling_mode));
-+        return ORBIS_VIDEO_OUT_ERROR_INVALID_TILING_MODE;
-+    }
-+
-+    LOG_INFO(Lib_VideoOut,
-+             "attributeIndex = {}, pixelFormat = {}, aspectRatio = {}, "
-+             "tilingMode = {}, width = {}, height = {}, pitchInPixel = {}, option = {:#x}",
-+             attributeIndex, GetPixelFormatString(attribute->pixel_format), attribute->aspect_ratio,
-+             static_cast<u32>(attribute->tiling_mode), attribute->width, attribute->height,
-+             attribute->pitch_in_pixel, attribute->option);
-+
-+    std::unique_lock lock{port->port_mutex};
-+    std::memcpy(&port->groups[attributeIndex].attrib, attribute, sizeof(BufferAttribute));
-+    return 0;
-+}
-+
-+void VideoOutDriver::Flip(const Request& req) {
-+    // Update HDR status before presenting.
-+    presenter->SetHDR(req.port->is_hdr);
-+
-+    // Present the frame.
-+    presenter->Present(req.frame);
-+
-+    // Update flip status.
-+    auto* port = req.port;
-+    {
-+        std::unique_lock lock{port->port_mutex};
-+        auto& flip_status = port->flip_status;
-+        flip_status.count++;
-+        flip_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
-+        flip_status.tsc = Libraries::Kernel::sceKernelReadTsc();
-+        flip_status.flip_arg = req.flip_arg;
-+        flip_status.current_buffer = req.index;
-+        if (req.eop) {
-+            --flip_status.gc_queue_num;
-+        }
-+        --flip_status.flip_pending_num;
-+    }
-+
-+    // Trigger flip events for the port.
-+    for (auto event : port->flip_events) {
-+        auto equeue = Kernel::GetEqueue(event);
-+        if (equeue != nullptr) {
-+            equeue->TriggerEvent(
-+                static_cast<u64>(OrbisVideoOutInternalEventId::Flip),
-+                Kernel::OrbisKernelEvent::Filter::VideoOut,
-+                reinterpret_cast<void*>(static_cast<u64>(OrbisVideoOutInternalEventId::Flip) |
-+                                        (req.flip_arg << 16)));
-+        }
-+    }
-+
-+    // Reset prev flip label
-+    if (port->prev_index != -1) {
-+        port->buffer_labels[port->prev_index] = 0;
-+        port->SignalVoLabel();
-+    }
-+    // save to prev buf index
-+    port->prev_index = req.index;
-+}
-+
-+void VideoOutDriver::DrawBlankFrame() {
-+    const auto empty_frame = presenter->PrepareBlankFrame(true);
-+    presenter->Present(empty_frame, false, false);
-+}
-+
-+void VideoOutDriver::DrawLastFrame() {
-+    const auto frame = presenter->PrepareLastFrame();
-+    if (frame != nullptr) {
-+        presenter->Present(frame, true);
-+    }
-+}
-+
-+bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
-+                                bool is_eop /*= false*/) {
-+    {
-+        std::unique_lock lock{port->port_mutex};
-+        if (index != -1 && port->flip_status.flip_pending_num > 16) {
-+            LOG_ERROR(Lib_VideoOut, "Flip queue is full");
-+            return false;
-+        }
-+
-+        if (is_eop) {
-+            ++port->flip_status.gc_queue_num;
-+        }
-+        ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
-+        port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
-+    }
-+
-+    if (!is_eop) {
-+        // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-+        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
-+    } else {
-+        SubmitFlipInternal(port, index, flip_arg, is_eop);
-+    }
-+
-+    return true;
-+}
-+
-+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
-+    Vulkan::Frame* frame;
-+    if (index == -1) {
-+        frame = presenter->PrepareBlankFrame(false);
-+    } else {
-+        const auto& buffer = port->buffer_slots[index];
-+        ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
-+        const auto& group = port->groups[buffer.group_index];
-+        frame = presenter->PrepareFrame(group, buffer.address_left);
-+    }
-+
-+    std::scoped_lock lock{mutex};
-+    requests.push({
-+        .frame = frame,
-+        .port = port,
-+        .flip_arg = flip_arg,
-+        .index = index,
-+        .eop = is_eop,
-+    });
-+}
-+
-+void VideoOutDriver::PresentThread(std::stop_token token) {
-+    const std::chrono::nanoseconds vblank_period(1000000000 /
-+                                                 EmulatorSettings.GetVblankFrequency());
-+
-+    Common::SetCurrentThreadName("shadPS4:PresentThread");
-+    Common::SetCurrentThreadRealtime(vblank_period);
-+
-+    Common::AccurateTimer timer{vblank_period};
-+
-+    const auto receive_request = [this] -> Request {
-+        std::scoped_lock lk{mutex};
-+        if (!requests.empty()) {
-+            const auto request = requests.front();
-+            requests.pop();
-+            return request;
-+        }
-+        return {};
-+    };
-+
-+    while (!token.stop_requested()) {
-+        timer.Start();
-+
-+        if (DebugState.IsGuestThreadsPaused()) {
-+            DrawLastFrame();
-+            timer.End();
-+            continue;
-+        }
-+
-+        // Check if it's time to take a request.
-+        auto& vblank_status = main_port.vblank_status;
-+        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
-+            const auto request = receive_request();
-+            if (!request) {
-+                if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
-+                    if (!main_port.is_open) {
-+                        DrawBlankFrame();
-+                    } else if (ImGui::Core::MustKeepDrawing()) {
-+                        DrawLastFrame();
-+                    }
-+                }
-+            } else {
-+                Flip(request);
-+                FRAME_END;
-+            }
-+        }
-+
-+        {
-+            // Needs lock here as can be concurrently read by `sceVideoOutGetVblankStatus`
-+            std::scoped_lock lock{main_port.vo_mutex};
-+
-+            // Trigger flip events for the port
-+            for (auto event : main_port.vblank_events) {
-+                auto equeue = Kernel::GetEqueue(event);
-+                if (equeue != nullptr) {
-+                    equeue->TriggerEvent(
-+                        static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
-+                        Kernel::OrbisKernelEvent::Filter::VideoOut,
-+                        reinterpret_cast<void*>(
-+                            static_cast<u64>(OrbisVideoOutInternalEventId::Vblank) |
-+                            (vblank_status.count << 16)));
-+                }
-+            }
-+
-+            // Update vblank status
-+            vblank_status.count++;
-+            vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
-+            vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
-+            main_port.vblank_cv.notify_all();
-+        }
-+
-+        timer.End();
-+    }
-+}
-+
-+} // namespace Libraries::VideoOut
++    const auto present_frame = presenter->PrepareBlankFrame(true);
++    presenter->Present(present_frame, false, false);
+ }
+ 
+ void VideoOutDriver::DrawLastFrame() {
 diff --git a/src/core/libraries/videoout/video_out.cpp b/src/core/libraries/videoout/video_out.cpp
 index f3bf16e8..514dad68 100644
 --- a/src/core/libraries/videoout/video_out.cpp
@@ -287371,7 +286711,7 @@ index 00000000..734a9692
 +constexpr int ORBIS_VOICE_ERROR_TOPOLOGY = 0x804E0807;
 +constexpr int ORBIS_VOICE_ERROR_RESOURCE_INSUFFICIENT = 0x804E0808;
 diff --git a/src/core/linker.cpp b/src/core/linker.cpp
-index e887b31f..fc3f6102 100644
+index e887b31f..fd331b42 100644
 --- a/src/core/linker.cpp
 +++ b/src/core/linker.cpp
 @@ -21,10 +21,14 @@
@@ -287519,7 +286859,17 @@ index e887b31f..fc3f6102 100644
  }
  
  s32 Linker::LoadAndStartModule(const std::filesystem::path& path, u64 args, const void* argp,
-@@ -726,9 +785,8 @@ void Linker::Relocate(Module* module) {
+@@ -718,17 +777,16 @@ void Linker::Relocate(Module* module) {
+                 }
+                 const auto veneer = m_hle_veneers->Allocate(*symrec.hle_adapter);
+                 if (const auto* failure = std::get_if<GuestCpu::HleVeneerFailure>(&veneer)) {
+-                    LOG_ERROR(Core_Linker, "Unable to allocate FEX HLE veneer for {}: {}", symrec.name,
+-                              failure->error);
++                    LOG_ERROR(Core_Linker, "Unable to allocate FEX HLE veneer for {}: {}",
++                              symrec.symbol.name, failure->error);
+                 } else {
+                     symbol_virtual_addr = std::get<u64>(veneer);
+                 }
              }
  #endif
              rel_is_resolved = (symbol_virtual_addr != 0);
@@ -388831,10 +388181,10 @@ index 80c63447..118d2590 100644
 +
 +} // namespace Shader
 diff --git a/src/shader_recompiler/resource.h b/src/shader_recompiler/resource.h
-index 2ac5463d..443234af 100644
+index 2ac5463d..21fcc90a 100644
 --- a/src/shader_recompiler/resource.h
 +++ b/src/shader_recompiler/resource.h
-@@ -1,182 +1,243 @@
+@@ -1,182 +1,261 @@
 -// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 -// SPDX-License-Identifier: GPL-2.0-or-later
 -
@@ -389145,6 +388495,9 @@ index 2ac5463d..443234af 100644
 +};
 +
 +struct ImageResource {
++    static constexpr f32 Hosted2DSampleY = 0.5f;
++    static constexpr u32 Hosted2DIntegerY = 0u;
++
 +    SharpFetch<AmdGpu::Image> sharp_fetch{};
 +    bool is_depth{};
 +    bool is_atomic{};
@@ -389154,6 +388507,21 @@ index 2ac5463d..443234af 100644
 +    u8 constant_mip_index{};
 +    MipStorageFallbackMode mip_fallback_mode{};
 +    SharpFetchPostOp post_op{};
++
++    // Android/Adreno: a plain 1D image that no guest code writes, views or multisamples is
++    // emulated as a 2D view with a synthetic height. Adreno has no usable 1D storage image,
++    // and Cortex/Adreno drivers reject pipelines that sample one. Kept from the arm64 port.
++    bool Is1DHostedAs2D(const AmdGpu::Image& sharp) const noexcept {
++        return !is_array && !is_written && !is_depth && !is_atomic && !is_r128 &&
++               sharp.GetType() == AmdGpu::ImageType::Color1D && sharp.height == 0 &&
++               sharp.NumLayers() == 1 && sharp.NumLevels() == 1 && sharp.NumSamples() == 1 &&
++               sharp.GetTileMode() == AmdGpu::TileMode::Thin2DThin;
++    }
++
++    AmdGpu::ImageType GetHostViewType(const AmdGpu::Image& sharp) const noexcept {
++        return Is1DHostedAs2D(sharp) ? AmdGpu::ImageType::Color2D
++                                     : sharp.GetViewType(is_array);
++    }
 +
 +    constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
 +        AmdGpu::Image image{};
@@ -418708,7 +418076,7 @@ index a0977668..7791d642 100644
              break;
          }
 diff --git a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
-index 4afd7263..9f96c328 100644
+index 4afd7263..33581558 100644
 --- a/src/video_core/renderer_vulkan/vk_instance.h
 +++ b/src/video_core/renderer_vulkan/vk_instance.h
 @@ -1,4 +1,4 @@
@@ -418884,7 +418252,14 @@ index 4afd7263..9f96c328 100644
      bool provoking_vertex{};
      bool shader_stencil_export{};
      bool image_load_store_lod{};
-@@ -545,9 +579,13 @@ private:
+@@ -542,12 +576,20 @@ private:
+     bool amd_mixed_attachment_samples{};
+     bool push_descriptor{};
+     bool vertex_attribute_divisor{};
++    // VK_EXT_legacy_vertex_attributes is force-disabled on drivers whose integer attribute
++    // handling is broken (see ShouldDisableLegacyVertexAttributes). The extension has no
++    // feature struct in the device chain, so this is only a record of availability.
++    bool legacy_vertex_attributes{};
      bool shader_atomic_float{};
      bool shader_atomic_float2{};
      bool workgroup_memory_explicit_layout{};

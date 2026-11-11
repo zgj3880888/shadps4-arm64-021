@@ -279,24 +279,55 @@ jobs:
               if ! bash runtime/scripts/build-shadps4-arm64.sh; then
                 # One failed round costs half an hour, and clang stops at the first error in
                 # every TU it touches. Re-run the same build with keep-going so every remaining
-                # bad TU shows up in a single log, then replay each failure with the error limit
-                # lifted: default clang caps a TU at 20 diagnostics, which hides the cascade a
-                # half-applied merge produces.
+                # bad TU shows up in a single log, then replay *every* failure with the error
+                # limit lifted: default clang caps a TU at 20 diagnostics, which hides the
+                # cascade a half-applied merge produces.
+                #
+                # The replay is de-duplicated by error signature instead of truncated, because
+                # most failing TUs here are collateral damage from one broken header -- seeing
+                # the same "no member named X" 40 times buries the two genuinely distinct
+                # errors underneath it.
                 echo "=== keep-going pass: surface every failing TU ==="
                 cd runtime/build/shadps4-arm64
                 set +e
                 ninja -k 0 -j "$(nproc)" > /tmp/keepgoing.log 2>&1
                 grep "^FAILED:" /tmp/keepgoing.log | sed "s/^FAILED: //" | sort -u > /tmp/failed.txt
                 echo "failing targets: $(wc -l < /tmp/failed.txt)"
-                head -40 /tmp/failed.txt
+                cat /tmp/failed.txt
+                : > /tmp/signatures.txt
                 while read -r obj; do
                   [ -n "$obj" ] || continue
-                  echo "=== full diagnostics: $obj"
                   cmd=$(ninja -t commands "$obj" 2>/dev/null | tail -1)
                   [ -n "$cmd" ] || continue
-                  eval "$cmd -ferror-limit=0" 2>&1 |
-                    grep -E "error:|fatal error:" | head -25
-                done < <(head -8 /tmp/failed.txt)
+                  # -ferror-limit=0 lifts the cap; -fno-caret-diagnostics drops the source
+                  # echo lines so a signature fits on one grep-able line.
+                  eval "$cmd -ferror-limit=0 -fno-caret-diagnostics -fno-diagnostics-show-option" \
+                    > /tmp/tu.log 2>&1
+                  # Keep the first diagnostic per unique message. Preserve the file:line that
+                  # produced it, and remember which TU it came from.
+                  grep -E "error:|fatal error:" /tmp/tu.log |
+                    sed -E "s/^([^:]+:[0-9]+:[0-9]+: )//" |
+                    sort -u |
+                    while IFS= read -r sig; do
+                      if ! grep -qxF "$sig" /tmp/signatures.txt; then
+                        printf "%s\n" "$sig" >> /tmp/signatures.txt
+                        printf "  [%s] %s\n" "$(basename "$obj" .o)" "$sig"
+                      fi
+                    done
+                done < /tmp/failed.txt
+                echo "=== distinct error signatures: $(wc -l < /tmp/signatures.txt) ==="
+                echo "=== per-TU first 6 diagnostics, for locating the origin ==="
+                n=0
+                while read -r obj; do
+                  [ -n "$obj" ] || continue
+                  n=$((n + 1))
+                  [ "$n" -le 30 ] || break
+                  cmd=$(ninja -t commands "$obj" 2>/dev/null | tail -1)
+                  [ -n "$cmd" ] || continue
+                  echo "--- $obj"
+                  eval "$cmd -ferror-limit=0 -fno-diagnostics-show-option" 2>&1 |
+                    grep -E "error:|fatal error:" | head -6
+                done < /tmp/failed.txt
                 echo "=== keep-going tail ==="
                 tail -25 /tmp/keepgoing.log
                 exit 1
