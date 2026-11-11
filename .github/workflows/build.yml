@@ -388,18 +388,21 @@ jobs:
           set -euo pipefail
           bin=core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64
           fail=0
+          # Every pattern here is matched literally against a binary, so -- (end of options) is
+          # mandatory: the CLI strings start with "--bachata", which grep would otherwise treat
+          # as flags and fail on before it ever opens the binary.
           # CLI contract the Bachata S4+ frontend uses when it launches the core.
           for s in '--bachata-socket' '--bachata-storage-root' '--bachata-saf-socket' \
                    '--bachata-saf-token' '--patch-session'; do
-            if grep -qaF "$s" "$bin"; then echo "OK   cli $s"; else echo "MISS cli $s"; fail=1; fi
+            if grep -qaF -- "$s" "$bin"; then echo "OK   cli $s"; else echo "MISS cli $s"; fail=1; fi
           done
           # Android platform glue: SAF broker, FEX guest CPU, managed patch sessions.
           for s in 'saf-mirror' 'PATCH_SESSION_LOAD' 'PATCH_APPLIED' 'BACHATA_FEX_SIGNAL' \
                    'BACHATA_INPUT motion'; do
-            if grep -qaF "$s" "$bin"; then echo "OK   glue $s"; else echo "MISS glue $s"; fail=1; fi
+            if grep -qaF -- "$s" "$bin"; then echo "OK   glue $s"; else echo "MISS glue $s"; fail=1; fi
           done
           # Upstream 0.21.1 identity, proving this is not the 2026-06 base tree.
-          if grep -qaF 'libSceJpegDec.sprx' "$bin"; then echo "OK   base libSceJpegDec"; else
+          if grep -qaF -- 'libSceJpegDec.sprx' "$bin"; then echo "OK   base libSceJpegDec"; else
             echo "MISS base libSceJpegDec"; fail=1; fi
           [ "$fail" -eq 0 ] || { echo "core does not match expectations"; exit 1; }
 
