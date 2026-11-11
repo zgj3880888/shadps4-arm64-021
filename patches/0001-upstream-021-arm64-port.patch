@@ -164005,10 +164005,10 @@ index 1494a2ab..9b00b72d 100644
  } // namespace Libraries::LibcInternal
 \ No newline at end of file
 diff --git a/src/core/libraries/libc_internal/libc_internal_io.cpp b/src/core/libraries/libc_internal/libc_internal_io.cpp
-index 8d5f6d5a..4c86f349 100644
+index 8d5f6d5a..12fb8e43 100644
 --- a/src/core/libraries/libc_internal/libc_internal_io.cpp
 +++ b/src/core/libraries/libc_internal/libc_internal_io.cpp
-@@ -1,490 +1,488 @@
+@@ -1,490 +1,499 @@
 -// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 -// SPDX-License-Identifier: GPL-2.0-or-later
 -
@@ -164983,6 +164983,17 @@ index 8d5f6d5a..4c86f349 100644
 +    LIB_FUNCTION("rQFVBXp-Cxg", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fseek);
 +    LIB_FUNCTION("lbB+UlZqVG0", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fread);
 +    LIB_FUNCTION("MUjC4lbHrK4", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fflush);
++    LIB_FUNCTION("uodLYyUip20", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fclose);
++}
++
++// Used by ForceRegisterLib() to force HLE over a broken LLE libc: only the file I/O entry points
++// are taken over, so guest printf/stdout still reach the LLE implementation. 0.21.1 folded these
++// five ids into RegisterlibSceLibcInternalIo above and dropped this narrower variant, but the
++// FEX guest-CPU path still calls it, so keep both.
++void ForceRegisterlibSceLibcInternalIo(Core::Loader::SymbolsResolver* sym) {
++    LIB_FUNCTION("xeYO4u7uyJ0", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fopen);
++    LIB_FUNCTION("rQFVBXp-Cxg", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fseek);
++    LIB_FUNCTION("lbB+UlZqVG0", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fread);
 +    LIB_FUNCTION("uodLYyUip20", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fclose);
 +}
 +
