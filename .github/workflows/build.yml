@@ -101,8 +101,9 @@ jobs:
         # swallowing happened in CreateDevice(), inside Emulator::Run, and
         # symbols_resolver.cpp kept the brace of a function that no longer exists.
         #
-        # Each repair asserts an exact match count so a patch refresh that already carries
-        # the fix fails here instead of silently double-fixing.
+        # Each repair is idempotent: a refreshed patch may already carry the fix (the merged
+        # tree commits them), in which case the pattern is simply absent and the step moves on.
+        # More than one match still fails, because that means the patch drifted.
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -116,8 +117,11 @@ jobs:
               o = old.replace(b"\n", nl)
               n = new.replace(b"\n", nl)
               found = data.count(o)
+              if found == 0:
+                  print(f"already repaired {path}")
+                  return
               if found != 1:
-                  sys.exit(f"{path}: expected exactly 1 match, found {found}")
+                  sys.exit(f"{path}: expected at most 1 match, found {found}")
               p.write_bytes(data.replace(o, n))
               print(f"repaired {path}")
 
@@ -273,12 +277,28 @@ jobs:
               glslang-standalone --version
               bash runtime/scripts/install-debian-runtime-deps.sh
               if ! bash runtime/scripts/build-shadps4-arm64.sh; then
-                echo "=== recompiling one failing TU with no error limit ==="
+                # One failed round costs half an hour, and clang stops at the first error in
+                # every TU it touches. Re-run the same build with keep-going so every remaining
+                # bad TU shows up in a single log, then replay each failure with the error limit
+                # lifted: default clang caps a TU at 20 diagnostics, which hides the cascade a
+                # half-applied merge produces.
+                echo "=== keep-going pass: surface every failing TU ==="
                 cd runtime/build/shadps4-arm64
-                cmd=$(ninja -t commands \
-                  CMakeFiles/shadps4.dir/src/imgui/invitation_prompt_layer.cpp.o | tail -1)
-                echo "$cmd" | cut -c1-200
-                eval "$cmd -ferror-limit=0" || true
+                set +e
+                ninja -k 0 -j "$(nproc)" > /tmp/keepgoing.log 2>&1
+                grep "^FAILED:" /tmp/keepgoing.log | sed "s/^FAILED: //" | sort -u > /tmp/failed.txt
+                echo "failing targets: $(wc -l < /tmp/failed.txt)"
+                head -40 /tmp/failed.txt
+                while read -r obj; do
+                  [ -n "$obj" ] || continue
+                  echo "=== full diagnostics: $obj"
+                  cmd=$(ninja -t commands "$obj" 2>/dev/null | tail -1)
+                  [ -n "$cmd" ] || continue
+                  eval "$cmd -ferror-limit=0" 2>&1 |
+                    grep -E "error:|fatal error:" | head -25
+                done < <(head -8 /tmp/failed.txt)
+                echo "=== keep-going tail ==="
+                tail -25 /tmp/keepgoing.log
                 exit 1
               fi
             ' 2>&1 | tee build.log
