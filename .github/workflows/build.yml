@@ -330,6 +330,26 @@ jobs:
                 done < /tmp/failed.txt
                 echo "=== keep-going tail ==="
                 tail -25 /tmp/keepgoing.log
+                echo "=== diagnostics: libc_internal_io.cpp symbol table ==="
+                # The link step reports ForceRegisterlibSceLibcInternalIo as undefined even
+                # though the definition is in the tree and the TU compiles. Print what the
+                # compiler actually emitted, plus the source shape, so the next round can tell
+                # a dropped definition apart from a wrong namespace or a stale object file.
+                io=CMakeFiles/shadps4.dir/src/core/libraries/libc_internal/libc_internal_io.cpp.o
+                if [ -f "$io" ]; then
+                  nm -C "$io" 2>/dev/null |
+                    grep -E "RegisterlibSceLibcInternal|ForceRegister" ||
+                    echo "  (no Register*/ForceRegister* symbols in $io)"
+                  ls -l "$io"
+                else
+                  echo "  $io missing"
+                fi
+                echo "--- source tail"
+                tail -20 ../src/core/libraries/libc_internal/libc_internal_io.cpp
+                echo "--- grep ForceRegister in source"
+                grep -n "ForceRegister" ../src/core/libraries/libc_internal/libc_internal_io.cpp || echo "  (absent)"
+                echo "--- header decl"
+                grep -n "ForceRegister" ../src/core/libraries/libc_internal/libc_internal_io.h || echo "  (absent)"
                 exit 1
               fi
             ' 2>&1 | tee build.log
